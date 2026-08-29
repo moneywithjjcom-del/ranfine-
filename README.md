@@ -65,7 +65,7 @@ whether it will ever fire on its own.
 No dependencies beyond the standard library. Python 3.9+.
 
 ```bash
-git clone https://github.com/YOURNAME/ranfine.git
+git clone https://github.com/moneywithjjcom-del/ranfine-.git
 cd ranfine
 cp watch.example.json watch.json   # then edit it
 ```
