@@ -1,0 +1,8 @@
+{
+  "slack_webhook": "",
+  "workflows": [
+    {"id": "17", "name": "invoice-sync", "every_minutes": 15},
+    {"id": "22", "name": "nightly-export", "every_minutes": 1440, "min_items": 1},
+    {"id": "31", "name": "webhook-intake"}
+  ]
+}
