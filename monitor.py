@@ -156,7 +156,7 @@ def nodes_that_ran(execution):
     return set(run_data)
 
 
-def nodes_that_stopped_running(executions, threshold=0.6):
+def nodes_that_stopped_running(executions, declared=None, threshold=0.6):
     """Nodes that used to run on most runs and did not run on the latest one.
 
     Absence on its own is not a fault -- the untaken side of an IF is absent on
@@ -164,6 +164,14 @@ def nodes_that_stopped_running(executions, threshold=0.6):
     is a node that *used* to run and has quietly stopped: the condition that
     used to match no longer does, and the work silently is not happening while
     the run still reports success.
+
+    ``declared`` is the set of node names the workflow currently contains. Pass
+    it and a node the client deliberately deleted or renamed stops being a
+    finding, because it is no longer declared -- that is an edit, not a
+    failure. Without it, every legitimate change to a workflow produces false
+    positives until the history ages out, which is the failure mode that makes
+    a monitor get muted. Correctly identified as this approach's weak point by
+    an n8n operator on 2026-08-30.
 
     Needs MIN_HISTORY prior runs to have an opinion. Returns [] otherwise.
     """
@@ -178,6 +186,8 @@ def nodes_that_stopped_running(executions, threshold=0.6):
         return []
     usual = []
     for node in set().union(*history):
+        if declared is not None and node not in declared:
+            continue  # deleted or renamed: an edit, not a silent failure
         seen = sum(1 for h in history if node in h)
         if seen / len(history) >= threshold and node not in latest:
             usual.append((node, seen, len(history)))
@@ -226,7 +236,7 @@ def human(delta):
     return "%dd %dh" % (total // 86400, (total % 86400) // 3600)
 
 
-def check_workflow(spec, executions, now):
+def check_workflow(spec, executions, now, declared=None):
     """Alerts for one workflow. `executions` is newest-first, successful only.
 
     Empty list means it has never succeeded -- which is its own alarm, not a
@@ -296,7 +306,7 @@ def check_workflow(spec, executions, now):
 
     # --- 3. did a step that normally runs quietly stop running? ---
     if spec.get("watch_steps"):
-        for node, seen, total in nodes_that_stopped_running(executions):
+        for node, seen, total in nodes_that_stopped_running(executions, declared):
             alerts.append({
                 "workflow": name,
                 "kind": "step_stopped",
@@ -338,6 +348,17 @@ def recent_successful_executions(base, api_key, workflow_id, limit=HISTORY):
            "&limit=%d&workflowId=%s" % (base.rstrip("/"), limit, workflow_id))
     payload = get_json(url, api_key)
     return (payload or {}).get("data") or []
+
+
+def declared_nodes(base, api_key, workflow_id):
+    """The node names the workflow currently contains.
+
+    Read fresh each run rather than cached, so an edit is reflected on the very
+    next check instead of after a stale baseline has already fired.
+    """
+    url = "%s/api/v1/workflows/%s" % (base.rstrip("/"), workflow_id)
+    payload = get_json(url, api_key)
+    return {n.get("name") for n in (payload or {}).get("nodes") or [] if n.get("name")}
 
 
 def post_slack(webhook, text):
@@ -394,7 +415,15 @@ def main(argv):
                 "detail": "could not query n8n: %s" % exc,
             })
             continue
-        alerts.extend(check_workflow(spec, runs, now))
+        declared = None
+        if spec.get("watch_steps"):
+            try:
+                declared = declared_nodes(base, api_key, spec["id"])
+            except (urllib.error.URLError, OSError, ValueError):
+                # Unknown is safer than stale: without the declared set the
+                # step check simply has no opinion this run.
+                declared = None
+        alerts.extend(check_workflow(spec, runs, now, declared))
 
     report = format_report(alerts)
     print(report)

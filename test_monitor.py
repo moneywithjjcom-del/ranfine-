@@ -363,3 +363,60 @@ def test_weekday_of_tolerates_junk():
     assert monitor.weekday_of({"stoppedAt": "???"}) is None
     assert monitor.weekday_of({}) is None
     assert monitor.weekday_of(None) is None
+
+
+# --- baseline drift ---------------------------------------------------------
+#
+# "someone legitimately edits a workflow and your expected node set goes stale,
+# suddenly you're swimming in false positives until you re-baseline every
+# changed workflow" -- n8n operator, 2026-08-30. That is exactly right about
+# the version without `declared`, and it is the failure that gets a monitor
+# muted. A node the client deleted is an edit, not a silent failure.
+
+def test_a_deleted_node_is_an_edit_not_a_failure():
+    runs = [run_with_nodes("Trigger", "Check")] + [
+        run_with_nodes("Trigger", "Check", "Send invoice") for _ in range(4)]
+
+    # without the declared set, the removal looks exactly like a silent failure
+    assert [n for n, _, _ in monitor.nodes_that_stopped_running(runs)] == ["Send invoice"]
+
+    # with it, the node is simply gone from the workflow and nothing fires
+    declared = {"Trigger", "Check"}
+    assert monitor.nodes_that_stopped_running(runs, declared) == []
+
+
+def test_a_renamed_node_does_not_alert_under_its_old_name():
+    """A rename is a delete plus an add. The old name stops appearing, but it
+    is no longer declared, so it is not a finding. The new name has no history
+    yet, so it is not one either - the baseline just rebuilds quietly."""
+    runs = [run_with_nodes("Trigger", "Send invoices")] + [
+        run_with_nodes("Trigger", "Send invoice") for _ in range(4)]
+    declared = {"Trigger", "Send invoices"}
+    assert monitor.nodes_that_stopped_running(runs, declared) == []
+
+
+def test_a_node_that_is_still_declared_but_stopped_running_still_alerts():
+    """The fix must not swallow the real case: the node is still in the
+    workflow, it just stopped being reached."""
+    runs = [run_with_nodes("Trigger", "Check")] + [
+        run_with_nodes("Trigger", "Check", "Send invoice") for _ in range(4)]
+    declared = {"Trigger", "Check", "Send invoice"}
+    assert [n for n, _, _ in monitor.nodes_that_stopped_running(runs, declared)] == ["Send invoice"]
+
+
+def test_check_workflow_passes_the_declared_set_through():
+    runs = [run_with_nodes("Trigger", "Check")] + [
+        run_with_nodes("Trigger", "Check", "Send") for _ in range(4)]
+    spec = {"name": "x", "watch_steps": True}
+    assert monitor.check_workflow(spec, runs, NOW, {"Trigger", "Check"}) == []
+    assert [a["kind"] for a in monitor.check_workflow(
+        spec, runs, NOW, {"Trigger", "Check", "Send"})] == ["step_stopped"]
+
+
+def test_no_declared_set_keeps_the_old_behaviour():
+    """If the workflow could not be read this run, the check still works -
+    unknown must not mean silent."""
+    runs = [run_with_nodes("Trigger", "Check")] + [
+        run_with_nodes("Trigger", "Check", "Send") for _ in range(4)]
+    assert [a["kind"] for a in monitor.check_workflow(
+        {"name": "x", "watch_steps": True}, runs, NOW, None)] == ["step_stopped"]

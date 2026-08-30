@@ -48,6 +48,22 @@ The calendar point came from AleksGorbatov on the n8n forum, who maintains
 integrations for a dozen-plus clients: *"a baseline is an expectation with a
 calendar attached... averages hide exactly the days you care about."*
 
+## Edits are not failures
+
+The obvious version of "which steps normally run" breaks the first time someone
+edits a workflow: a deleted node stops appearing, looks like a silent failure,
+and you get false positives until the history ages out. That is how a monitor
+earns itself a mute rule.
+
+So the step check reads the workflow's **currently declared** nodes each run and
+ignores anything no longer in it. A deleted or renamed node is an edit. A node
+that is still declared and stopped being reached is a finding. If the workflow
+can't be read that run, the check keeps its old behaviour rather than going
+quiet — unknown must not mean silent.
+
+Raised by an n8n operator on 2026-08-30, who was right about the version that
+shipped before it.
+
 ## "Never ran" is its own alarm
 
 Staleness detection needs a baseline. *Never ran* has none — a schedule trigger
@@ -137,7 +153,7 @@ Every alert case is a fixture; no network involved.
 python -m pytest -q
 ```
 
-40 tests. They encode one rule: **alert on real trouble, never on missing
+45 tests. They encode one rule: **alert on real trouble, never on missing
 information.** A monitor that cries wolf gets muted, and a muted monitor is
 worse than none.
 
