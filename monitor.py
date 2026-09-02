@@ -21,7 +21,8 @@ Usage:
     export N8N_URL=https://n8n.example.com
     export N8N_API_KEY=...
 
-    python monitor.py --scan      # check every active workflow, no config needed
+    python monitor.py --scan      # check active workflows, no config needed
+    python monitor.py --scan 100  # ... more of them; the default stops at 25
     python monitor.py watch.json  # check the ones you have chosen to watch
 
 Start with --scan. It needs nothing but the two variables above, and it prints a
@@ -78,6 +79,16 @@ WEEKDAY_MIN_HISTORY = 3
 # How many recent executions to pull per workflow. Deep enough that a daily job
 # has several samples of each weekday -- ten runs would give barely one.
 HISTORY = 30
+
+# Scan mode pulls full run data, which is the expensive part of this whole tool:
+# every execution carries every node's output. Thirty runs each across eighty
+# workflows is megabytes of payload and eighty requests against an instance whose
+# owner has not met us yet. A first run that hammers somebody's production n8n
+# would disprove "read-only and harmless" more convincingly than any claim proves
+# it. So scan pulls a shorter history than a configured watch does, and covers a
+# bounded number of workflows unless asked for more.
+SCAN_HISTORY = 12
+SCAN_LIMIT = 25
 
 SCHEDULE_TRIGGERS = ("n8n-nodes-base.scheduleTrigger",
                      "n8n-nodes-base.cron",
@@ -631,19 +642,30 @@ def load_env_file(path=".env"):
         pass  # no file is a normal, supported case
 
 
-def scan(base, api_key, now):
-    """Check every active workflow with sensible defaults and no config file.
+def scan(base, api_key, now, limit=SCAN_LIMIT):
+    """Check active workflows with sensible defaults and no config file.
 
     The config file is the barrier to finding out whether you have this problem
     at all: you cannot write one without already knowing your workflow IDs, and
     nobody looks those up on the strength of a stranger's claim. Scan mode
     answers the question in one command, then prints a config for anyone who
     decides they want to keep watching.
+
+    Bounded on purpose. `limit` caps how many workflows get the expensive
+    run-data fetch, and anything skipped is named rather than quietly dropped --
+    a truncated scan that reads as "you are fine" is the same lie this tool
+    exists to catch.
     """
     workflows = active_workflows(base, api_key)
     if not workflows:
         print("No active workflows found. Nothing to check.")
         return [], []
+
+    skipped = workflows[limit:]
+    workflows = workflows[:limit]
+    print("Checking %d active workflow(s), %d recent runs each. "
+          "This reads execution data, so give it a moment."
+          % (len(workflows), SCAN_HISTORY))
 
     alerts, specs = [], []
     for workflow in workflows:
@@ -652,15 +674,23 @@ def scan(base, api_key, now):
         declared = {n.get("name") for n in workflow.get("nodes") or []
                     if n.get("name")}
         try:
-            runs = recent_successful_executions(base, api_key, spec["id"])
+            runs = recent_successful_executions(base, api_key, spec["id"],
+                                                limit=SCAN_HISTORY)
         except (urllib.error.URLError, OSError, ValueError) as exc:
             alerts.append({"workflow": spec["name"], "kind": "unreachable",
                            "detail": "could not query n8n: %s" % exc})
             continue
         alerts.extend(check_workflow(spec, runs, now, declared))
 
-    print("Checked %d active workflow(s).\n" % len(workflows))
+    print("")
     print(format_report(alerts))
+    if skipped:
+        print("\nNot checked (%d over the limit of %d): %s"
+              % (len(skipped), limit,
+                 ", ".join(w.get("name") or str(w.get("id")) for w in skipped[:10])
+                 + (", ..." if len(skipped) > 10 else "")))
+        print("Run `python monitor.py --scan %d` to include them."
+              % (len(skipped) + limit))
     return alerts, specs
 
 
@@ -682,7 +712,13 @@ def main(argv):
 
     if scanning:
         try:
-            alerts, specs = scan(base, api_key, now)
+            limit = int(argv[2]) if len(argv) > 2 else SCAN_LIMIT
+        except ValueError:
+            print("usage: python monitor.py --scan [how-many-workflows]",
+                  file=sys.stderr)
+            return 2
+        try:
+            alerts, specs = scan(base, api_key, now, limit)
         except (urllib.error.URLError, OSError, ValueError) as exc:
             print("could not reach n8n: %s" % exc, file=sys.stderr)
             return 2
