@@ -20,7 +20,12 @@ Read-only. It never writes to your n8n.
 Usage:
     export N8N_URL=https://n8n.example.com
     export N8N_API_KEY=...
-    python monitor.py watch.json
+
+    python monitor.py --scan      # check every active workflow, no config needed
+    python monitor.py watch.json  # check the ones you have chosen to watch
+
+Start with --scan. It needs nothing but the two variables above, and it prints a
+watch.json at the end if you want to keep going.
 
 `watch.json`:
 
@@ -73,6 +78,13 @@ WEEKDAY_MIN_HISTORY = 3
 # How many recent executions to pull per workflow. Deep enough that a daily job
 # has several samples of each weekday -- ten runs would give barely one.
 HISTORY = 30
+
+SCHEDULE_TRIGGERS = ("n8n-nodes-base.scheduleTrigger",
+                     "n8n-nodes-base.cron",
+                     "n8n-nodes-base.interval")
+
+# Enough to turn a trigger rule into "how often should this have checked in".
+MINUTES_PER = {"minutes": 1.0, "hours": 60.0, "days": 1440.0, "weeks": 10080.0}
 
 DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday",
              "Friday", "Saturday", "Sunday")
@@ -377,6 +389,57 @@ def baseline_for(latest, history):
     return None, None
 
 
+def schedule_minutes(workflow):
+    """How often a workflow's schedule says it should run, in minutes.
+
+    Returns None when it cannot be read with confidence: a cron expression, an
+    unfamiliar field, or no schedule trigger at all. None is the honest answer
+    and it has a consequence worth stating -- the check-in test simply has no
+    opinion about that workflow. Guessing an interval would produce a lateness
+    alert on something that was never late, and one false alarm costs more trust
+    than one missed alert.
+
+    Where a workflow has several rules, the shortest wins: something due every
+    hour and every day is late once the hour passes.
+    """
+    best = None
+    for node in (workflow or {}).get("nodes") or []:
+        if node.get("type") not in SCHEDULE_TRIGGERS:
+            continue
+        rule = (node.get("parameters") or {}).get("rule") or {}
+        for entry in rule.get("interval") or []:
+            field = (entry or {}).get("field")
+            if field not in MINUTES_PER:
+                continue  # cronExpression and seconds are not worth guessing at
+            try:
+                count = float(entry.get("%sInterval" % field) or 1)
+            except (TypeError, ValueError):
+                continue
+            minutes = MINUTES_PER[field] * count
+            if minutes > 0 and (best is None or minutes < best):
+                best = minutes
+    return best
+
+
+def spec_for(workflow):
+    """A watch spec for a workflow nobody has configured by hand.
+
+    Every check on, because the point of scan mode is to answer "do I have this
+    problem" before anyone has decided which workflows they care about. Checks
+    that need history stay silent until they have it, so turning them all on
+    costs nothing on a fresh instance.
+    """
+    spec = {"id": str(workflow.get("id")),
+            "name": workflow.get("name") or str(workflow.get("id")),
+            "watch_output": True,
+            "watch_steps": True,
+            "watch_node_output": True}
+    every = schedule_minutes(workflow)
+    if every:
+        spec["every_minutes"] = every
+    return spec
+
+
 def human(delta):
     total = int(delta.total_seconds())
     if total < 3600:
@@ -520,6 +583,16 @@ def recent_successful_executions(base, api_key, workflow_id, limit=HISTORY):
     return (payload or {}).get("data") or []
 
 
+def active_workflows(base, api_key, limit=250):
+    """Every active workflow, with its nodes, in one call.
+
+    The nodes come back on this payload, so scan mode gets the declared-node set
+    for free and does not need a second request per workflow.
+    """
+    url = "%s/api/v1/workflows?active=true&limit=%d" % (base.rstrip("/"), limit)
+    return (get_json(url, api_key) or {}).get("data") or []
+
+
 def declared_nodes(base, api_key, workflow_id):
     """The node names the workflow currently contains.
 
@@ -558,13 +631,47 @@ def load_env_file(path=".env"):
         pass  # no file is a normal, supported case
 
 
+def scan(base, api_key, now):
+    """Check every active workflow with sensible defaults and no config file.
+
+    The config file is the barrier to finding out whether you have this problem
+    at all: you cannot write one without already knowing your workflow IDs, and
+    nobody looks those up on the strength of a stranger's claim. Scan mode
+    answers the question in one command, then prints a config for anyone who
+    decides they want to keep watching.
+    """
+    workflows = active_workflows(base, api_key)
+    if not workflows:
+        print("No active workflows found. Nothing to check.")
+        return [], []
+
+    alerts, specs = [], []
+    for workflow in workflows:
+        spec = spec_for(workflow)
+        specs.append(spec)
+        declared = {n.get("name") for n in workflow.get("nodes") or []
+                    if n.get("name")}
+        try:
+            runs = recent_successful_executions(base, api_key, spec["id"])
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            alerts.append({"workflow": spec["name"], "kind": "unreachable",
+                           "detail": "could not query n8n: %s" % exc})
+            continue
+        alerts.extend(check_workflow(spec, runs, now, declared))
+
+    print("Checked %d active workflow(s).\n" % len(workflows))
+    print(format_report(alerts))
+    return alerts, specs
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
         return 2
 
-    load_env_file(os.path.join(os.path.dirname(os.path.abspath(argv[1])), ".env"))
-    config = json.loads(open(argv[1], encoding="utf-8").read())
+    scanning = argv[1] in ("--scan", "-s")
+    load_env_file(os.path.join(
+        os.path.dirname(os.path.abspath(argv[0] if scanning else argv[1])), ".env"))
     base = os.environ.get("N8N_URL", "").strip()
     api_key = os.environ.get("N8N_API_KEY", "").strip()
     if not base or not api_key:
@@ -572,6 +679,20 @@ def main(argv):
         return 2
 
     now = datetime.now(timezone.utc)
+
+    if scanning:
+        try:
+            alerts, specs = scan(base, api_key, now)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            print("could not reach n8n: %s" % exc, file=sys.stderr)
+            return 2
+        if specs:
+            print("\nTo keep watching these, save the following as watch.json "
+                  "and run: python monitor.py watch.json")
+            print(json.dumps({"workflows": specs}, indent=2))
+        return 1 if alerts else 0
+
+    config = json.loads(open(argv[1], encoding="utf-8").read())
     alerts = []
     for spec in config.get("workflows", []):
         try:

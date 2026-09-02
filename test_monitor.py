@@ -546,3 +546,67 @@ def test_check_workflow_reports_node_output_only_when_asked():
     kinds = [a["kind"] for a in monitor.check_workflow(
         {"name": "x", "watch_node_output": True}, runs, NOW)]
     assert kinds == ["node_keys_lost"]
+
+
+# --- scan mode -------------------------------------------------------------
+#
+# The rule: an interval we cannot read confidently must produce None, never a
+# guess. A wrong interval means a lateness alert on a workflow that was never
+# late, and one false alarm costs more trust than one missed alert.
+
+
+def workflow(*trigger_params, **kwargs):
+    """A workflow whose schedule trigger carries the given interval rules."""
+    nodes = [{"name": "Trigger", "type": "n8n-nodes-base.scheduleTrigger",
+              "parameters": {"rule": {"interval": list(trigger_params)}}}]
+    nodes += [{"name": n, "type": "n8n-nodes-base.set"}
+              for n in kwargs.get("also", [])]
+    return {"id": kwargs.get("id", "17"), "name": kwargs.get("name", "wf"),
+            "nodes": nodes}
+
+
+def test_reads_a_plain_hourly_trigger():
+    assert monitor.schedule_minutes(workflow({"field": "hours"})) == 60
+
+
+def test_reads_an_explicit_interval_count():
+    assert monitor.schedule_minutes(
+        workflow({"field": "minutes", "minutesInterval": 5})) == 5
+    assert monitor.schedule_minutes(
+        workflow({"field": "days", "daysInterval": 2})) == 2880
+
+
+def test_the_shortest_rule_wins():
+    """Due hourly and daily means late once the hour passes."""
+    assert monitor.schedule_minutes(
+        workflow({"field": "days"}, {"field": "hours"})) == 60
+
+
+def test_a_cron_expression_is_not_guessed_at():
+    assert monitor.schedule_minutes(
+        workflow({"field": "cronExpression", "expression": "0 */3 * * *"})) is None
+
+
+def test_a_workflow_with_no_schedule_has_no_interval():
+    assert monitor.schedule_minutes(
+        {"nodes": [{"name": "Hook", "type": "n8n-nodes-base.webhook"}]}) is None
+    assert monitor.schedule_minutes({}) is None
+    assert monitor.schedule_minutes(None) is None
+
+
+def test_a_nonsense_interval_count_is_ignored_not_crashed():
+    assert monitor.schedule_minutes(
+        workflow({"field": "hours", "hoursInterval": "soon"})) is None
+
+
+def test_spec_turns_every_check_on():
+    spec = monitor.spec_for(workflow({"field": "hours"}, id=9, name="sync"))
+    assert spec["id"] == "9" and spec["name"] == "sync"
+    assert spec["every_minutes"] == 60
+    assert spec["watch_output"] and spec["watch_steps"] and spec["watch_node_output"]
+
+
+def test_spec_omits_the_interval_it_could_not_read():
+    """No key at all, so check_workflow's lateness test simply never fires."""
+    spec = monitor.spec_for(workflow({"field": "cronExpression"}))
+    assert "every_minutes" not in spec
