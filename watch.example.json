@@ -3,6 +3,7 @@
   "workflows": [
     {"id": "17", "name": "invoice-sync", "every_minutes": 15},
     {"id": "22", "name": "nightly-export", "every_minutes": 1440, "min_items": 1},
+    {"id": "27", "name": "rag-ingest", "every_minutes": 60, "watch_steps": true, "watch_node_output": true},
     {"id": "31", "name": "webhook-intake"}
   ]
 }

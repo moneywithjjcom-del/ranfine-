@@ -194,6 +194,156 @@ def nodes_that_stopped_running(executions, declared=None, threshold=0.6):
     return sorted(usual)
 
 
+def _has_value(value):
+    """Whether a field carries anything. "" counts as empty, deliberately.
+
+    A field that normally holds content and now holds an empty string is the
+    reported failure, not a healthy variation: the r/n8n case below handed the
+    next node exactly that. Zero and False are values, not emptiness.
+    """
+    return value is not None and value != "" and value != [] and value != {}
+
+
+def workflow_version_of(execution):
+    """The workflow version this run executed, or None if not recorded.
+
+    A per-node baseline only means anything while the workflow is unchanged.
+    Edit a node and "what it normally emits" is a claim about a workflow that no
+    longer exists. n8n stamps a versionId on the workflow and carries it on the
+    execution's embedded workflowData, so a version change is the honest place
+    to throw the baseline away.
+
+    The cost is real and worth stating rather than hiding: a workflow edited
+    every few days never accumulates enough same-version history to have an
+    opinion about its own output. That is correct -- a baseline built across an
+    edit is worse than no baseline -- but it does mean actively maintained
+    workflows are covered by the check-in and step checks rather than this one.
+    """
+    if not isinstance(execution, dict):
+        return None
+    direct = execution.get("workflowVersionId")
+    if direct:
+        return direct
+    data = execution.get("workflowData")
+    if isinstance(data, dict):
+        return data.get("versionId")
+    return None
+
+
+def node_output_shapes(execution):
+    """Per node: how many items it emitted, and which keys carried a value.
+
+    Two numbers rather than one, because they fail differently.
+
+    The case this exists for was described by an n8n operator on 2026-09-01: an
+    embedding call whose quota had run out returned HTTP 200 with an empty body.
+    The node executed, so it landed in runData with a success status, handed an
+    empty string to the next node, and the run finished clean. Retrieval was
+    dead for days and every execution reported success.
+
+    Absence detection cannot see that, because the node is present. The
+    workflow-level item count cannot see it either, because the workflow still
+    produced an answer -- just one built on nothing retrieved. Only the node's
+    own output shape shows it.
+    """
+    run_data = (((execution or {}).get("data") or {})
+                .get("resultData") or {}).get("runData")
+    if not isinstance(run_data, dict):
+        return {}
+    shapes = {}
+    for node, runs in run_data.items():
+        if not isinstance(runs, list):
+            continue
+        items = 0
+        keys = set()
+        seen_any = False
+        for run in runs:
+            main = ((run or {}).get("data") or {}).get("main")
+            if not isinstance(main, list):
+                continue
+            seen_any = True
+            for branch in main:
+                if not isinstance(branch, list):
+                    continue
+                items += len(branch)
+                for item in branch:
+                    payload = (item or {}).get("json")
+                    if not isinstance(payload, dict):
+                        continue
+                    for key, value in payload.items():
+                        if _has_value(value):
+                            keys.add(key)
+        if seen_any:
+            shapes[node] = (items, frozenset(keys))
+    return shapes
+
+
+def nodes_emitting_nothing(executions, declared=None, threshold=0.6):
+    """Nodes that ran, reported success, and stopped carrying what they carry.
+
+    Returns (node, kind, evidence) triples. Two kinds, deliberately unequal:
+
+      "keys_lost"  fields the node normally populates came back empty. The
+                   stronger signal, because a shape change is hard to explain
+                   away as a quiet day.
+      "no_items"   the node emitted nothing at all -- and only when it has
+                   emitted something on every prior run. Weaker on its own: a
+                   search step returning zero results some days is correct, not
+                   broken, so a bare zero is treated as evidence only where zero
+                   has never happened before.
+
+    Only runs of the same workflow version are compared, so an edit resets the
+    baseline rather than alerting on itself. `declared` drops nodes the client
+    has since removed, for the same reason it does in nodes_that_stopped_running.
+    """
+    if len(executions) < MIN_HISTORY + 1:
+        return []
+    latest = executions[0]
+
+    history = executions[1:]
+    version = workflow_version_of(latest)
+    if version is not None:
+        history = [e for e in history if workflow_version_of(e) == version]
+    if len(history) < MIN_HISTORY:
+        return []
+
+    latest_shapes = node_output_shapes(latest)
+    if not latest_shapes:
+        return []
+    history_shapes = [s for s in (node_output_shapes(e) for e in history) if s]
+    if len(history_shapes) < MIN_HISTORY:
+        return []
+
+    findings = []
+    for node, (items, keys) in sorted(latest_shapes.items()):
+        if declared is not None and node not in declared:
+            continue
+        samples = [s[node] for s in history_shapes if node in s]
+        if len(samples) < MIN_HISTORY:
+            continue
+        if len(samples) / float(len(history_shapes)) < threshold:
+            continue  # not a node that reliably runs; absence is its normal
+
+        every_key = set()
+        for _, sample_keys in samples:
+            every_key |= set(sample_keys)
+        usual = {k for k in every_key
+                 if sum(1 for _, ks in samples if k in ks) / float(len(samples))
+                 >= threshold}
+        # Only meaningful while the node still emitted something. A node that
+        # emitted nothing has trivially lost every key, which is the same single
+        # failure counted twice -- and it would defeat the guard below that lets
+        # a legitimately-empty node stay quiet.
+        lost = sorted(usual - set(keys)) if items > 0 else []
+        if lost:
+            findings.append((node, "keys_lost", lost))
+
+        counts = [c for c, _ in samples]
+        if items == 0 and all(c > 0 for c in counts):
+            findings.append((node, "no_items", median(counts)))
+    return findings
+
+
 def weekday_of(execution):
     """Which day of the week this run belongs to, or None if unreadable."""
     when = parse_time((execution or {}).get("stoppedAt")
@@ -314,6 +464,26 @@ def check_workflow(spec, executions, now, declared=None):
                           "the latest one; the run still reports success"
                           % (node, seen, total),
             })
+
+    # --- 4. did a step run, report success, and carry nothing? ---
+    if spec.get("watch_node_output"):
+        for node, kind, evidence in nodes_emitting_nothing(executions, declared):
+            if kind == "keys_lost":
+                alerts.append({
+                    "workflow": name,
+                    "kind": "node_keys_lost",
+                    "detail": "step '%s' ran and reported success but returned "
+                              "nothing under %s, which it normally populates"
+                              % (node, ", ".join("'%s'" % k for k in evidence)),
+                })
+            else:
+                alerts.append({
+                    "workflow": name,
+                    "kind": "node_no_items",
+                    "detail": "step '%s' ran and reported success but emitted "
+                              "0 items, having emitted items on every prior "
+                              "run (median %g)" % (node, evidence),
+                })
 
     return alerts
 
@@ -448,8 +618,13 @@ def main(argv):
 # the JSON shapes are not guessable and guessing produces false alarms, which
 # is the one failure this tool cannot afford.
 #
-#   - Branch marked SKIPPED inside a run marked COMPLETED. The work silently
-#     did not happen and the run still reports success.
+#   - Output that is present, plausible and wrong. node_output_shapes reads
+#     shape, never meaning: a node returning last week's data in the right
+#     shape passes every check here. Needs semantic assertions per workflow,
+#     which is a different product.
+#   - A per-node baseline for workflows edited often. Version-scoped history
+#     means a weekly-edited workflow never accumulates one. A diff of what
+#     actually changed between versions would let unaffected nodes keep theirs.
 #   - Credential expiry that fails before the request leaves ("Unable to sign
 #     without access token"), so there is no HTTP status for error handling
 #     built around status codes to catch.

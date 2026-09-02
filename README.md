@@ -48,6 +48,40 @@ The calendar point came from AleksGorbatov on the n8n forum, who maintains
 integrations for a dozen-plus clients: *"a baseline is an expectation with a
 calendar attached... averages hide exactly the days you care about."*
 
+## Absence is a signal. So is presence.
+
+`watch_steps` catches a step that stopped running. It cannot catch the opposite,
+which an n8n operator described on 2026-09-01 and which is more common:
+
+> An embedding call whose quota had run out came back 200 with an empty body.
+> The node executed, so it lands in runData with a happy status, and the next
+> node got an empty string and carried on. Retrieval was dead for days and every
+> execution reported success.
+
+The node is present, so absence detection sees nothing. The workflow still
+produced an answer — just one built on nothing retrieved — so a workflow-level
+item count sees nothing either. Both of the checks above miss it.
+
+`watch_node_output` compares each node against what that node normally emits,
+with two rules of deliberately unequal weight:
+
+- **Fields that normally carry a value came back empty.** The strong signal. A
+  shape change is hard to explain away as a quiet day, and an empty string in a
+  field that normally holds content counts as empty on purpose.
+- **The node emitted nothing at all**, and only where that node has emitted
+  something on *every* prior run. Weak on its own: a search step returning zero
+  results some days is correct, not broken, so a bare zero is evidence only
+  where zero has never happened before.
+
+Comparisons are made only across runs of the same workflow version. Edit the
+workflow and the baseline resets rather than alerting on itself — which means an
+actively-edited workflow rarely accumulates enough same-version history for this
+check to have an opinion. That is the honest cost: a baseline built across an
+edit is worse than no baseline.
+
+What it still does not catch: output that is present, plausible, and wrong.
+Nothing here reads meaning, only shape.
+
 ## Edits are not failures
 
 The obvious version of "which steps normally run" breaks the first time someone
@@ -117,6 +151,9 @@ can act on it:
 - `every_minutes` — how often you expect success. Omit for event-driven
   workflows with no schedule; they won't be checked for lateness.
 - `watch_output` — turn on deviation detection against the rolling median.
+- `watch_steps` — alert when a step that normally runs stops running.
+- `watch_node_output` — alert when a step *runs*, reports success, and carries
+  nothing. See below; this is the one that catches the green-but-empty node.
 - `min_items` — a hard floor, for when you genuinely know the number. Takes
   precedence over deviation, so one problem produces one alert.
 - `slack_webhook` — optional; without it, output goes to stdout only.

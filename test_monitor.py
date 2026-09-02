@@ -420,3 +420,129 @@ def test_no_declared_set_keeps_the_old_behaviour():
         run_with_nodes("Trigger", "Check", "Send") for _ in range(4)]
     assert [a["kind"] for a in monitor.check_workflow(
         {"name": "x", "watch_steps": True}, runs, NOW, None)] == ["step_stopped"]
+
+
+# --- per-node output shape -------------------------------------------------
+#
+# The failure these serve, reported by an n8n operator on 2026-09-01: a node
+# ran, returned HTTP 200 with an empty body, went green, and handed an empty
+# string downstream. Present in runData, successful execution, produced nothing.
+
+
+def shape_run(nodes, version="v1", minutes_ago=0):
+    """An execution whose runData carries the given per-node item payloads.
+
+    `nodes` maps node name to a list of json dicts, so a node emitting nothing
+    is [] and a node emitting two rows is [{...}, {...}].
+    """
+    run_data = {}
+    for name, items in nodes.items():
+        run_data[name] = [{"data": {"main": [[{"json": i} for i in items]]}}]
+    return {
+        "id": "1",
+        "status": "success",
+        "stoppedAt": (NOW - timedelta(minutes=minutes_ago)).isoformat(),
+        "workflowData": {"versionId": version},
+        "data": {"resultData": {
+            "lastNodeExecuted": list(nodes)[-1] if nodes else None,
+            "runData": run_data,
+        }},
+    }
+
+
+def healthy_history(n=5):
+    """Runs where Embed carries real vectors. Counts vary, as real ones do -
+    a constant series would hide any dependence on variance."""
+    counts = [4, 6, 5, 7, 5, 6, 4]
+    return [shape_run({
+        "Fetch": [{"id": i} for i in range(counts[k % len(counts)])],
+        "Embed": [{"vector": [0.1, 0.2], "text": "chunk %d" % i}
+                  for i in range(counts[k % len(counts)])],
+    }, minutes_ago=60 * (k + 1)) for k in range(n)]
+
+
+def test_node_output_shapes_counts_items_and_populated_keys():
+    shapes = monitor.node_output_shapes(
+        shape_run({"Embed": [{"vector": [0.1], "text": "a"}, {"vector": [0.2], "text": "b"}]}))
+    assert shapes["Embed"] == (2, frozenset({"vector", "text"}))
+
+
+def test_empty_string_is_not_a_value():
+    """The reported failure exactly: 200 with an empty body, node goes green."""
+    shapes = monitor.node_output_shapes(
+        shape_run({"Embed": [{"vector": [], "text": ""}]}))
+    assert shapes["Embed"] == (1, frozenset())
+
+
+def test_zero_and_false_are_values_not_emptiness():
+    shapes = monitor.node_output_shapes(
+        shape_run({"Count": [{"total": 0, "ok": False}]}))
+    assert shapes["Count"] == (1, frozenset({"total", "ok"}))
+
+
+def test_a_node_that_ran_but_returned_empty_fields_is_reported():
+    latest = shape_run({
+        "Fetch": [{"id": 1}, {"id": 2}, {"id": 3}],
+        "Embed": [{"vector": [], "text": ""}, {"vector": [], "text": ""}],
+    })
+    found = monitor.nodes_emitting_nothing([latest] + healthy_history())
+    assert found == [("Embed", "keys_lost", ["text", "vector"])]
+
+
+def test_a_node_that_emitted_nothing_is_reported_when_zero_is_unprecedented():
+    latest = shape_run({"Fetch": [{"id": 1}], "Embed": []})
+    kinds = [k for _, k, _ in monitor.nodes_emitting_nothing(
+        [latest] + healthy_history())]
+    assert kinds == ["no_items"]
+
+
+def test_zero_is_not_reported_for_a_node_that_is_sometimes_legitimately_empty():
+    """A search step returning no results some days is correct, not broken."""
+    history = healthy_history(3) + [shape_run({
+        "Fetch": [{"id": 1}], "Embed": []}, minutes_ago=600)]
+    latest = shape_run({"Fetch": [{"id": 1}], "Embed": []})
+    assert monitor.nodes_emitting_nothing([latest] + history) == []
+
+
+def test_editing_the_workflow_resets_the_baseline():
+    """History from before an edit describes a workflow that no longer exists."""
+    latest = shape_run({"Fetch": [{"id": 1}], "Embed": []}, version="v2")
+    assert monitor.nodes_emitting_nothing([latest] + healthy_history()) == []
+
+
+def test_a_removed_node_is_an_edit_not_a_failure():
+    latest = shape_run({
+        "Fetch": [{"id": 1}, {"id": 2}],
+        "Embed": [{"vector": [], "text": ""}],
+    })
+    runs = [latest] + healthy_history()
+    assert monitor.nodes_emitting_nothing(runs, {"Fetch", "Embed"})
+    assert monitor.nodes_emitting_nothing(runs, {"Fetch"}) == []
+
+
+def test_thin_history_says_nothing():
+    latest = shape_run({"Fetch": [{"id": 1}], "Embed": []})
+    assert monitor.nodes_emitting_nothing([latest] + healthy_history(2)) == []
+
+
+def test_a_node_that_only_sometimes_runs_is_not_held_to_a_baseline():
+    """Absence is normal for it, so its output shape is not a promise."""
+    history = healthy_history(5)
+    history[0] = shape_run({"Fetch": [{"id": 1}], "Embed": [{"vector": [1]}],
+                            "Rare": [{"x": 1}]}, minutes_ago=60)
+    latest = shape_run({"Fetch": [{"id": 1}],
+                        "Embed": [{"vector": [1], "text": "a"}],
+                        "Rare": [{"x": None}]})
+    assert [n for n, _, _ in monitor.nodes_emitting_nothing([latest] + history)] == []
+
+
+def test_check_workflow_reports_node_output_only_when_asked():
+    latest = shape_run({
+        "Fetch": [{"id": 1}, {"id": 2}],
+        "Embed": [{"vector": [], "text": ""}],
+    })
+    runs = [latest] + healthy_history()
+    assert monitor.check_workflow({"name": "x"}, runs, NOW) == []
+    kinds = [a["kind"] for a in monitor.check_workflow(
+        {"name": "x", "watch_node_output": True}, runs, NOW)]
+    assert kinds == ["node_keys_lost"]
