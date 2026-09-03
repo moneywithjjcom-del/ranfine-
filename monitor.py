@@ -301,6 +301,75 @@ def node_output_shapes(execution):
     return shapes
 
 
+def _type_name(value):
+    """A coarse shape name for a value, or None when it carries nothing.
+
+    Deliberately coarse. 1 and 1.0 are the same shape for this purpose, and
+    distinguishing them would alarm on every numeric field that happened to
+    round. Booleans are checked before numbers because bool is a subclass of
+    int in Python, so isinstance(True, int) is True and the obvious ordering
+    silently reports every boolean as a number.
+    """
+    if not _has_value(value):
+        return None
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "text"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "object"
+    return "other"
+
+
+def node_key_types(execution):
+    """Per node, the shape of each key that carried a value: {node: {key: type}}.
+
+    Reported by an n8n operator on 2026-09-03, describing the case the presence
+    check misses: "It may be blank or it could be in the wrong data type like an
+    array when it should be a string, so nothing errors."
+
+    A blank field is caught by node_output_shapes, because the key comes back
+    empty. An array where a string belongs is not: the key is present, it holds
+    a value, and every presence test passes. Only the type shows it.
+
+    Where a key appears more than once with conflicting types in the same run,
+    the first wins. Mixed types within one run are their own smell, but calling
+    that a fault would fire on any node that legitimately emits heterogeneous
+    rows.
+    """
+    run_data = (((execution or {}).get("data") or {})
+                .get("resultData") or {}).get("runData")
+    if not isinstance(run_data, dict):
+        return {}
+    types = {}
+    for node, runs in run_data.items():
+        if not isinstance(runs, list):
+            continue
+        seen = {}
+        for run in runs:
+            main = ((run or {}).get("data") or {}).get("main")
+            if not isinstance(main, list):
+                continue
+            for branch in main:
+                if not isinstance(branch, list):
+                    continue
+                for item in branch:
+                    payload = (item or {}).get("json")
+                    if not isinstance(payload, dict):
+                        continue
+                    for key, value in payload.items():
+                        name = _type_name(value)
+                        if name and key not in seen:
+                            seen[key] = name
+        if seen:
+            types[node] = seen
+    return types
+
+
 def nodes_emitting_nothing(executions, declared=None, threshold=0.6):
     """Nodes that ran, reported success, and stopped carrying what they carry.
 
@@ -309,6 +378,10 @@ def nodes_emitting_nothing(executions, declared=None, threshold=0.6):
       "keys_lost"  fields the node normally populates came back empty. The
                    stronger signal, because a shape change is hard to explain
                    away as a quiet day.
+      "type_changed"  a field the node normally fills with one shape came back
+                   as another - a list where every prior run held text. Strong,
+                   for the same reason: the shape changed, not the volume. Only
+                   counted where that key held one settled type historically.
       "no_items"   the node emitted nothing at all -- and only when it has
                    emitted something on every prior run. Weaker on its own: a
                    search step returning zero results some days is correct, not
@@ -333,9 +406,13 @@ def nodes_emitting_nothing(executions, declared=None, threshold=0.6):
     latest_shapes = node_output_shapes(latest)
     if not latest_shapes:
         return []
-    history_shapes = [s for s in (node_output_shapes(e) for e in history) if s]
-    if len(history_shapes) < MIN_HISTORY:
+    latest_types = node_key_types(latest)
+    history_pairs = [(sh, node_key_types(e))
+                     for sh, e in ((node_output_shapes(e), e) for e in history)
+                     if sh]
+    if len(history_pairs) < MIN_HISTORY:
         return []
+    history_shapes = [sh for sh, _ in history_pairs]
 
     findings = []
     for node, (items, keys) in sorted(latest_shapes.items()):
@@ -360,6 +437,30 @@ def nodes_emitting_nothing(executions, declared=None, threshold=0.6):
         lost = sorted(usual - set(keys)) if items > 0 else []
         if lost:
             findings.append((node, "keys_lost", lost))
+
+        # Only keys the node still populates AND normally populates. Disjoint
+        # from `lost` by construction, so one failure cannot report twice - the
+        # mistake the zero-items case made before the tests caught it.
+        node_types = latest_types.get(node) or {}
+        type_samples = [t[node] for _, t in history_pairs if node in t]
+        changed = []
+        for key in sorted(set(keys) & usual):
+            seen = [ts[key] for ts in type_samples if ts.get(key)]
+            if len(seen) < MIN_HISTORY:
+                continue
+            settled = seen[0]
+            if any(t != settled for t in seen):
+                continue  # this key legitimately varies; it promises nothing
+            # Unanimity, deliberately stricter than the threshold used for
+            # presence. A key that has ever legitimately held another type is
+            # not making a promise, and a false alarm costs more trust than a
+            # missed alert. Same reasoning as no_items requiring every prior
+            # run to be non-empty.
+            now = node_types.get(key)
+            if now and now != settled:
+                changed.append((key, settled, now))
+        if changed:
+            findings.append((node, "type_changed", changed))
 
         counts = [c for c, _ in samples]
         if items == 0 and all(c > 0 for c in counts):
@@ -549,6 +650,15 @@ def check_workflow(spec, executions, now, declared=None):
                     "detail": "step '%s' ran and reported success but returned "
                               "nothing under %s, which it normally populates"
                               % (node, ", ".join("'%s'" % k for k in evidence)),
+                })
+            elif kind == "type_changed":
+                alerts.append({
+                    "workflow": name,
+                    "kind": "node_type_changed",
+                    "detail": "step '%s' ran and reported success but returned "
+                              "%s" % (node, "; ".join(
+                                  "'%s' as %s where it is normally %s"
+                                  % (k, now, was) for k, was, now in evidence)),
                 })
             else:
                 alerts.append({

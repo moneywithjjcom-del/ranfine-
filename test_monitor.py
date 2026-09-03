@@ -610,3 +610,93 @@ def test_spec_omits_the_interval_it_could_not_read():
     """No key at all, so check_workflow's lateness test simply never fires."""
     spec = monitor.spec_for(workflow({"field": "cronExpression"}))
     assert "every_minutes" not in spec
+
+
+# --- wrong type, not missing value -----------------------------------------
+#
+# Reported by an n8n operator on 2026-09-03: "It may be blank or it could be in
+# the wrong data type like an array when it should be a string, so nothing
+# errors." A blank field is caught by presence. An array where a string belongs
+# is a value, so presence passes and only the type shows it.
+
+
+def typed_history(n=5, value="chunk"):
+    """Runs where Embed emits `text` as a string. Counts vary, as real ones do."""
+    counts = [4, 6, 5, 7, 5, 6, 4]
+    return [shape_run({
+        "Fetch": [{"id": i} for i in range(counts[k % len(counts)])],
+        "Embed": [{"text": "%s %d" % (value, i), "score": 0.5}
+                  for i in range(counts[k % len(counts)])],
+    }, minutes_ago=60 * (k + 1)) for k in range(n)]
+
+
+def test_type_names_are_coarse_and_booleans_are_not_numbers():
+    """bool is a subclass of int, so the obvious ordering reports True as a number."""
+    assert monitor._type_name(True) == "boolean"
+    assert monitor._type_name(1) == "number"
+    assert monitor._type_name(1.5) == "number"
+    assert monitor._type_name("a") == "text"
+    assert monitor._type_name([1]) == "list"
+    assert monitor._type_name({"a": 1}) == "object"
+
+
+def test_empty_values_have_no_type():
+    for empty in (None, "", [], {}):
+        assert monitor._type_name(empty) is None
+
+
+def test_node_key_types_reads_the_shape_of_each_populated_key():
+    types = monitor.node_key_types(
+        shape_run({"Embed": [{"text": "a", "score": 1, "ok": True, "tags": []}]}))
+    assert types["Embed"] == {"text": "text", "score": "number", "ok": "boolean"}
+
+
+def test_a_field_that_changes_type_is_reported():
+    """An array where a string belongs: present, non-empty, and wrong."""
+    latest = shape_run({
+        "Fetch": [{"id": 1}, {"id": 2}],
+        "Embed": [{"text": ["a", "b"], "score": 0.5}],
+    })
+    found = monitor.nodes_emitting_nothing([latest] + typed_history())
+    assert found == [("Embed", "type_changed", [("text", "text", "list")])]
+
+
+def test_a_key_that_legitimately_varies_in_type_promises_nothing():
+    history = typed_history(3) + [shape_run({
+        "Fetch": [{"id": 1}],
+        "Embed": [{"text": ["a"], "score": 0.5}]}, minutes_ago=500)] + [shape_run({
+        "Fetch": [{"id": 1}],
+        "Embed": [{"text": ["b"], "score": 0.5}]}, minutes_ago=600)]
+    latest = shape_run({"Fetch": [{"id": 1}],
+                        "Embed": [{"text": ["c"], "score": 0.5}]})
+    assert monitor.nodes_emitting_nothing([latest] + history) == []
+
+
+def test_an_emptied_field_reports_once_not_twice():
+    """keys_lost and type_changed must be disjoint - the zero-items bug again."""
+    latest = shape_run({
+        "Fetch": [{"id": 1}, {"id": 2}],
+        "Embed": [{"text": "", "score": 0.5}],
+    })
+    kinds = [k for _, k, _ in monitor.nodes_emitting_nothing(
+        [latest] + typed_history())]
+    assert kinds == ["keys_lost"]
+
+
+def test_a_number_staying_a_number_is_not_a_change():
+    """1 and 1.0 are the same shape; distinguishing them would alarm constantly."""
+    latest = shape_run({"Fetch": [{"id": 1}],
+                        "Embed": [{"text": "a", "score": 2}]})
+    assert monitor.nodes_emitting_nothing([latest] + typed_history()) == []
+
+
+def test_check_workflow_reports_a_type_change():
+    latest = shape_run({
+        "Fetch": [{"id": 1}, {"id": 2}],
+        "Embed": [{"text": ["a"], "score": 0.5}],
+    })
+    alerts = monitor.check_workflow(
+        {"name": "x", "watch_node_output": True},
+        [latest] + typed_history(), NOW)
+    assert [a["kind"] for a in alerts] == ["node_type_changed"]
+    assert "normally text" in alerts[0]["detail"]

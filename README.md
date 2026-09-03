@@ -68,6 +68,15 @@ with two rules of deliberately unequal weight:
 - **Fields that normally carry a value came back empty.** The strong signal. A
   shape change is hard to explain away as a quiet day, and an empty string in a
   field that normally holds content counts as empty on purpose.
+- **A field came back as the wrong type** — a list where every prior run held
+  text. Also strong, and for the same reason: the shape changed, not the volume.
+  Reported by an operator on 2026-09-03, describing what presence checking
+  misses: *"It may be blank or it could be in the wrong data type like an array
+  when it should be a string, so nothing errors."* A blank field is caught by the
+  rule above, because the key comes back empty. An array where a string belongs
+  is a value — key present, not empty, every presence test passes. Only the type
+  shows it. Counted only where that key held one type on *every* prior run;
+  a field that has ever legitimately varied is making no promise.
 - **The node emitted nothing at all**, and only where that node has emitted
   something on *every* prior run. Weak on its own: a search step returning zero
   results some days is correct, not broken, so a bare zero is evidence only
