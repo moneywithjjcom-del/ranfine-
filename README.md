@@ -135,7 +135,14 @@ check to have an opinion. That is the honest cost: a baseline built across an
 edit is worse than no baseline.
 
 What it still does not catch: output that is present, plausible, and wrong.
-Nothing here reads meaning, only shape.
+Nothing here reads meaning, only shape. The sharpest form of that, from an
+agency owner on r/n8n who scrapes prices: a site-wide change moves every row
+together, so your own history agrees with the wrong answer. Anything that
+compares a run against its own past has that blind spot, this included. The
+only thing that catches it is a known answer from outside the run - he keeps
+five URLs whose prices he checks by hand once a month - and that expected value
+has to come from a person, because a number you can compute drifts with the
+same change.
 
 ## Edits are not failures
 
