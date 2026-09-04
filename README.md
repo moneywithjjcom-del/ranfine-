@@ -48,6 +48,33 @@ The calendar point came from AleksGorbatov on the n8n forum, who maintains
 integrations for a dozen-plus clients: *"a baseline is an expectation with a
 calendar attached... averages hide exactly the days you care about."*
 
+## Monitoring that works looks like nothing happening
+
+An agency owner on r/n8n put it exactly: the first client he bundled monitoring
+into cancelled in month two, *"because from where he sat he was paying for nothing
+to happen."* What fixed it was one line a month with the numbers in it — *"412
+orders processed and 3 that needed a human, plus one line about anything that
+changed on their side."* Uptime percentages got no reaction at all; 99.8% means
+nothing to someone who has no idea what the missing 0.2 cost them.
+
+`--report` is that line:
+
+```
+Last 30 days, in your units:
+  - invoice-sync: 412 runs, 18,340 items, 3 needed a human.
+  - lead-router: 8,640 runs, 8,640 items, 0 needed a human. Changed since you
+    last blessed it: added 'Slack alert'; removed 'Send email'.
+```
+
+Counts are in the workflow's own units — the items its last node emitted — not
+ours. *Needed a human* is executions that ended in error. *Changed* is the current
+node list against the one `--scan` blessed into `watch.json`, which is how a client
+renaming a field without telling anyone becomes a line in a report instead of a
+surprise three weeks later.
+
+It is bounded at 250 runs per workflow, and when that is shorter than the window
+the line says so rather than quietly reporting a partial month as a whole one.
+
 ## History proposes. You bless.
 
 The rolling median has a failure an n8n operator named precisely: *"a rolling
@@ -153,7 +180,8 @@ cp watch.example.json watch.json   # then edit it
 ```bash
 export N8N_URL=https://n8n.example.com
 export N8N_API_KEY=...
-python monitor.py watch.json
+python monitor.py watch.json              # the checks
+python monitor.py --report watch.json 30  # the month, in your units
 ```
 
 Exits `0` when healthy and `1` when something needs attention, so cron and CI
@@ -184,6 +212,8 @@ can act on it:
   nothing. See below; this is the one that catches the green-but-empty node.
 - `expected_items` — a blessed baseline. When set, deviation is measured against
   this number instead of the rolling median. See below for why you want one.
+- `nodes` — the blessed node list. `--scan` writes it; `--report` names anything
+  added or removed since.
 - `min_items` — a hard floor, for when you genuinely know the number. Takes
   precedence over everything else, so one problem produces one alert.
 - `slack_webhook` — optional; without it, output goes to stdout only.

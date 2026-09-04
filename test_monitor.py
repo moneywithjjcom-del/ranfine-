@@ -775,3 +775,90 @@ def test_nothing_is_proposed_from_thin_or_empty_history():
     assert monitor.propose_expectation([execution(30, items=52)]) is None
     assert monitor.propose_expectation(
         [execution(30, items=52), execution(90, items=48)]) is None
+
+
+# --- the monthly one-liner ---------------------------------------------------
+#
+# "412 orders processed and 3 that needed a human, plus one line about anything
+# that changed on their side." Counts in the client's units, never percentages.
+
+
+SINCE = NOW - timedelta(days=30)
+
+
+def failed(minutes_ago):
+    return {"id": "9", "status": "error",
+            "stoppedAt": (NOW - timedelta(minutes=minutes_ago)).isoformat()}
+
+
+def test_summary_counts_runs_items_and_failures_inside_the_window():
+    ok = [execution(60, items=40), execution(120, items=50), execution(180, items=45)]
+    bad = [failed(90)]
+    r = monitor.summarise({"name": "orders"}, ok, bad, None, SINCE)
+    assert r["runs_ok"] == 3 and r["items"] == 135 and r["runs_failed"] == 1
+    assert r["items_known_runs"] == 3 and r["truncated_at"] is None
+
+
+def test_runs_outside_the_window_are_not_counted():
+    ok = [execution(60, items=40), execution(60 * 24 * 40, items=999)]
+    bad = [failed(60 * 24 * 45)]
+    r = monitor.summarise({"name": "orders"}, ok, bad, None, SINCE)
+    assert r["runs_ok"] == 1 and r["items"] == 40 and r["runs_failed"] == 0
+
+
+def test_pruned_run_data_is_counted_as_unknown_not_zero():
+    ok = [execution(60, items=40), execution(120), execution(180, items=45)]
+    r = monitor.summarise({"name": "orders"}, ok, [], None, SINCE)
+    assert r["runs_ok"] == 3 and r["items"] == 85 and r["items_known_runs"] == 2
+
+
+def test_a_capped_fetch_that_does_not_reach_the_window_start_is_named():
+    """250 runs of a ten-minute workflow is under two days, not a month."""
+    ok = [execution(10 * (k + 1), items=5) for k in range(250)]
+    r = monitor.summarise({"name": "fast"}, ok, [], None, SINCE, limit=250)
+    assert r["truncated_at"] is not None
+    assert r["truncated_at"].date() < NOW.date()
+
+
+def test_a_full_fetch_that_covers_the_window_is_not_flagged():
+    ok = [execution(60 * 24 * k + 30, items=5) for k in range(10)]
+    r = monitor.summarise({"name": "daily"}, ok, [], None, SINCE, limit=250)
+    assert r["truncated_at"] is None
+
+
+def test_changed_nodes_are_named_against_the_blessed_list():
+    spec = {"name": "x", "nodes": ["Trigger", "Check", "Send"]}
+    r = monitor.summarise(spec, [], [], {"Trigger", "Check", "Notify"}, SINCE)
+    assert r["changed"] == {"added": ["Notify"], "removed": ["Send"]}
+
+
+def test_no_blessed_nodes_means_no_change_line_at_all():
+    r = monitor.summarise({"name": "x"}, [], [], {"Trigger"}, SINCE)
+    assert r["changed"] is None
+
+
+def test_the_report_reads_like_a_sentence_and_has_no_percentages():
+    rows = [monitor.summarise(
+        {"name": "orders", "nodes": ["Trigger", "Send"]},
+        [execution(60, items=400), execution(120, items=12)],
+        [failed(90), failed(200), failed(300)],
+        {"Trigger", "Send", "Slack"}, SINCE)]
+    text = monitor.format_summary(rows, 30)
+    assert "Last 30 days, in your units:" in text
+    assert "orders: 2 runs, 412 items, 3 needed a human." in text
+    assert "added 'Slack'" in text
+    assert "%" not in text
+
+
+def test_the_report_says_when_it_could_not_see_the_whole_window():
+    ok = [execution(10 * (k + 1), items=1) for k in range(250)]
+    rows = [monitor.summarise({"name": "fast"}, ok, [], None, SINCE, limit=250)]
+    assert "Last 250 runs only" in monitor.format_summary(rows, 30)
+
+
+def test_scan_spec_blesses_the_node_list():
+    spec = monitor.spec_for({"id": 4, "name": "wf", "nodes": [
+        {"name": "Trigger", "type": "n8n-nodes-base.scheduleTrigger",
+         "parameters": {"rule": {"interval": [{"field": "hours"}]}}},
+        {"name": "Send", "type": "n8n-nodes-base.set"}]})
+    assert spec["nodes"] == ["Send", "Trigger"]

@@ -23,6 +23,7 @@ Usage:
 
     python monitor.py --scan      # check active workflows, no config needed
     python monitor.py --scan 100  # ... more of them; the default stops at 25
+    python monitor.py --report watch.json [days]   # the month, in your units
     python monitor.py watch.json  # check the ones you have chosen to watch
 
 Start with --scan. It needs nothing but the two variables above, and it prints a
@@ -89,6 +90,12 @@ HISTORY = 30
 # bounded number of workflows unless asked for more.
 SCAN_HISTORY = 12
 SCAN_LIMIT = 25
+
+# The monthly report pulls run data for a whole window, which is the one place
+# this tool is allowed to be expensive - it runs once a month, on purpose, by a
+# person. Still bounded, and the bound is named in the output when it bites.
+REPORT_LIMIT = 250
+REPORT_DAYS = 30
 
 SCHEDULE_TRIGGERS = ("n8n-nodes-base.scheduleTrigger",
                      "n8n-nodes-base.cron",
@@ -546,6 +553,13 @@ def spec_for(workflow):
             "watch_output": True,
             "watch_steps": True,
             "watch_node_output": True}
+    # The node list as it stands today. Saving the file blesses it, and the
+    # monthly report then names anything added or removed since - which is how
+    # a client renaming a field without telling anyone becomes one line in
+    # a report instead of a surprise.
+    names = sorted(n.get("name") for n in workflow.get("nodes") or [] if n.get("name"))
+    if names:
+        spec["nodes"] = names
     every = schedule_minutes(workflow)
     if every:
         spec["every_minutes"] = every
@@ -577,6 +591,88 @@ def propose_expectation(runs):
     if proposed <= 0:
         return None
     return int(round(proposed))
+
+
+def summarise(spec, successes, failures, declared, since, limit=REPORT_LIMIT):
+    """One workflow's month, in the client's units.
+
+    Reported by an agency owner on r/n8n (2026-08-28): the first client he
+    bundled monitoring into cancelled in month two, "because from where he sat
+    he was paying for nothing to happen." What fixed it was one line a month
+    with the numbers in it - "412 orders processed and 3 that needed a human,
+    plus one line about anything that changed on their side." Uptime percentages
+    got zero reaction. Monitoring that works is indistinguishable from nothing
+    happening, so this is what makes it visible.
+
+    Counts are in the workflow's own units - the items its terminal node
+    emitted - not in ours. "Needed a human" is executions that ended in error.
+    "Changed" is the declared node set against the one blessed in watch.json,
+    which is how a client renaming a field without telling anyone shows up.
+    """
+    ok = [e for e in successes
+          if (parse_time(e.get("stoppedAt") or e.get("startedAt")) or since) >= since]
+    bad = [e for e in failures
+           if (parse_time(e.get("stoppedAt") or e.get("startedAt")) or since) >= since]
+
+    counts = [item_count(e) for e in ok]
+    known = [c for c in counts if c is not None]
+
+    truncated_at = None
+    if len(successes) >= limit and successes:
+        oldest = parse_time(successes[-1].get("stoppedAt")
+                            or successes[-1].get("startedAt"))
+        if oldest is not None and oldest > since:
+            truncated_at = oldest
+
+    changed = None
+    blessed = spec.get("nodes")
+    if isinstance(blessed, list) and declared is not None:
+        before, after = set(blessed), set(declared)
+        changed = {"added": sorted(after - before),
+                   "removed": sorted(before - after)}
+
+    return {
+        "workflow": spec.get("name") or spec.get("id"),
+        "runs_ok": len(ok),
+        "runs_failed": len(bad),
+        "items": sum(known),
+        "items_known_runs": len(known),
+        "truncated_at": truncated_at,
+        "changed": changed,
+    }
+
+
+def format_summary(rows, days):
+    """The report itself. One line per workflow, no percentages.
+
+    412 orders and 3 that needed a human is a sentence a client can act on.
+    99.8% is not, because nobody knows what the missing 0.2 cost them.
+    """
+    lines = ["Last %d days, in your units:" % days]
+    for r in rows:
+        bits = ["%d runs" % r["runs_ok"]]
+        if r["items_known_runs"]:
+            item_bit = "{:,} items".format(r["items"])
+            if r["items_known_runs"] < r["runs_ok"]:
+                item_bit += " (from %d of %d runs; n8n had pruned the rest)" % (
+                    r["items_known_runs"], r["runs_ok"])
+            bits.append(item_bit)
+        bits.append("%d needed a human" % r["runs_failed"])
+        line = "  - %s: %s." % (r["workflow"], ", ".join(bits))
+        ch = r.get("changed")
+        if ch and (ch["added"] or ch["removed"]):
+            parts = []
+            if ch["added"]:
+                parts.append("added " + ", ".join("'%s'" % n for n in ch["added"]))
+            if ch["removed"]:
+                parts.append("removed " + ", ".join("'%s'" % n for n in ch["removed"]))
+            line += " Changed since you last blessed it: %s." % "; ".join(parts)
+        if r.get("truncated_at"):
+            line += (" (Last %d runs only, back to %s - the window is longer than "
+                     "that; raise REPORT_LIMIT for all of it.)"
+                     % (REPORT_LIMIT, r["truncated_at"].date().isoformat()))
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def human(delta):
@@ -728,16 +824,23 @@ def get_json(url, api_key, timeout=20):
         return json.loads(response.read().decode("utf-8"))
 
 
-def recent_successful_executions(base, api_key, workflow_id, limit=HISTORY):
-    """Most recent successful executions for one workflow, newest first.
+def recent_executions(base, api_key, workflow_id, status="success",
+                      limit=HISTORY, include_data=True):
+    """Most recent executions of one status for one workflow, newest first.
 
     Failures here are reported, never swallowed: a monitor that goes quiet when
     it breaks is the exact thing this exists to prevent.
     """
-    url = ("%s/api/v1/executions?status=success&includeData=true"
-           "&limit=%d&workflowId=%s" % (base.rstrip("/"), limit, workflow_id))
+    url = ("%s/api/v1/executions?status=%s&includeData=%s&limit=%d&workflowId=%s"
+           % (base.rstrip("/"), status, "true" if include_data else "false",
+              limit, workflow_id))
     payload = get_json(url, api_key)
     return (payload or {}).get("data") or []
+
+
+def recent_successful_executions(base, api_key, workflow_id, limit=HISTORY):
+    """Kept so every existing caller stays untouched."""
+    return recent_executions(base, api_key, workflow_id, "success", limit, True)
 
 
 def active_workflows(base, api_key, limit=250):
@@ -843,14 +946,46 @@ def scan(base, api_key, now, limit=SCAN_LIMIT):
     return alerts, specs
 
 
+def report(base, api_key, config, now, days=REPORT_DAYS):
+    """Build the month's one-liners for every watched workflow."""
+    since = now - timedelta(days=days)
+    rows = []
+    for spec in config.get("workflows", []):
+        try:
+            ok = recent_executions(base, api_key, spec["id"], "success",
+                                   REPORT_LIMIT, True)
+            bad = recent_executions(base, api_key, spec["id"], "error",
+                                    REPORT_LIMIT, False)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            rows.append({"workflow": spec.get("name") or spec.get("id"),
+                         "runs_ok": 0, "runs_failed": 0, "items": 0,
+                         "items_known_runs": 0, "truncated_at": None,
+                         "changed": None,
+                         "error": "could not query n8n: %s" % exc})
+            continue
+        declared = None
+        if isinstance(spec.get("nodes"), list):
+            try:
+                declared = declared_nodes(base, api_key, spec["id"])
+            except (urllib.error.URLError, OSError, ValueError):
+                declared = None
+        rows.append(summarise(spec, ok, bad, declared, since))
+    return rows
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
         return 2
 
     scanning = argv[1] in ("--scan", "-s")
+    reporting = argv[1] in ("--report", "-r")
+    if reporting and len(argv) < 3:
+        print("usage: python monitor.py --report watch.json [days]", file=sys.stderr)
+        return 2
+    config_path = argv[2] if reporting else argv[1]
     load_env_file(os.path.join(
-        os.path.dirname(os.path.abspath(argv[0] if scanning else argv[1])), ".env"))
+        os.path.dirname(os.path.abspath(argv[0] if scanning else config_path)), ".env"))
     base = os.environ.get("N8N_URL", "").strip()
     api_key = os.environ.get("N8N_API_KEY", "").strip()
     if not base or not api_key:
@@ -882,7 +1017,22 @@ def main(argv):
             print(json.dumps({"workflows": specs}, indent=2))
         return 1 if alerts else 0
 
-    config = json.loads(open(argv[1], encoding="utf-8").read())
+    config = json.loads(open(config_path, encoding="utf-8").read())
+
+    if reporting:
+        try:
+            days = int(argv[3]) if len(argv) > 3 else REPORT_DAYS
+        except ValueError:
+            print("usage: python monitor.py --report watch.json [days]",
+                  file=sys.stderr)
+            return 2
+        rows = report(base, api_key, config, now, days)
+        print(format_summary(rows, days))
+        for r in rows:
+            if r.get("error"):
+                print("  ! %s: %s" % (r["workflow"], r["error"]), file=sys.stderr)
+        return 1 if any(r.get("error") for r in rows) else 0
+
     alerts = []
     for spec in config.get("workflows", []):
         try:
