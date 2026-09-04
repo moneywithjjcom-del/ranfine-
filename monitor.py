@@ -552,6 +552,33 @@ def spec_for(workflow):
     return spec
 
 
+def propose_expectation(runs):
+    """What history suggests this workflow normally produces, or None.
+
+    The rolling median has a known failure: an outage longer than half the
+    window becomes the baseline, and the recovery then pages as the anomaly.
+    Named by an n8n operator on 2026-08-27 -- "a rolling learner will happily
+    learn a two-week outage as the new normal" -- and the answer another gave is
+    better than anything unsupervised: history PROPOSES an expectation, a human
+    BLESSES it, and a blessed expectation never drifts without another bless.
+
+    This is the proposing half. --scan writes it into the emitted watch.json as
+    `expected_items`; whoever saves that file is doing the blessing. Returns a
+    whole number, since nobody expects 4.5 rows.
+    """
+    # Every run counts, newest included. baseline_for deliberately leaves the
+    # newest out because it is the run under comparison; here nothing is being
+    # compared, so leaving it out would just discard the freshest sample. And a
+    # flat median rather than the weekday view: a blessed number is one number.
+    counts = [c for c in (item_count(e) for e in runs) if c is not None]
+    if len(counts) < MIN_HISTORY:
+        return None
+    proposed = median(counts)
+    if proposed <= 0:
+        return None
+    return int(round(proposed))
+
+
 def human(delta):
     total = int(delta.total_seconds())
     if total < 3600:
@@ -607,7 +634,16 @@ def check_workflow(spec, executions, now, declared=None):
                               % (latest_count, floor),
                 })
             elif spec.get("watch_output"):
-                baseline, described = baseline_for(latest, executions[1:])
+                blessed = spec.get("expected_items")
+                if isinstance(blessed, (int, float)) and blessed > 0:
+                    # A number a person set on purpose. It does not learn, so
+                    # an outage cannot become normal and a recovery cannot
+                    # page. It also does not follow a legitimate change until
+                    # someone changes it -- that is the trade, and it is the
+                    # right one for anything that pays the bills.
+                    baseline, described = float(blessed), "the expected count you set"
+                else:
+                    baseline, described = baseline_for(latest, executions[1:])
                 if baseline:
                     # Inclusive: a run at exactly the threshold is the case
                     # this exists for, not a near miss.
@@ -791,6 +827,9 @@ def scan(base, api_key, now, limit=SCAN_LIMIT):
                            "detail": "could not query n8n: %s" % exc})
             continue
         alerts.extend(check_workflow(spec, runs, now, declared))
+        proposed = propose_expectation(runs)
+        if proposed is not None:
+            spec["expected_items"] = proposed
 
     print("")
     print(format_report(alerts))
@@ -835,6 +874,11 @@ def main(argv):
         if specs:
             print("\nTo keep watching these, save the following as watch.json "
                   "and run: python monitor.py watch.json")
+            if any("expected_items" in sp for sp in specs):
+                print("expected_items is what recent history suggests each "
+                      "workflow normally produces. Check the numbers before you "
+                      "save the file: once set they do not drift, which is the "
+                      "point, so a wrong one stays wrong until you change it.")
             print(json.dumps({"workflows": specs}, indent=2))
         return 1 if alerts else 0
 

@@ -700,3 +700,78 @@ def test_check_workflow_reports_a_type_change():
         [latest] + typed_history(), NOW)
     assert [a["kind"] for a in alerts] == ["node_type_changed"]
     assert "normally text" in alerts[0]["detail"]
+
+
+# --- history proposes, a human blesses ------------------------------------
+#
+# The rolling median learns an outage as the new normal once the outage is
+# longer than half the window; the recovery then pages as the anomaly. A
+# blessed number does not learn. That is the whole point of it.
+
+
+def outage_history(good=3, dead=5):
+    """Three healthy runs, then five that produced nothing - newest first.
+
+    Counts vary on the healthy runs; a constant series would hide any
+    dependence on the median's behaviour.
+    """
+    dead_runs = [execution(60 * (k + 1), items=0) for k in range(dead)]
+    good_runs = [execution(60 * (dead + k + 1), items=[48, 55, 51][k])
+                 for k in range(good)]
+    return dead_runs + good_runs
+
+
+def test_the_rolling_median_learns_the_outage():
+    """The failure being fixed, pinned so the fix is measurable."""
+    runs = [execution(30, items=52)] + outage_history()
+    baseline, _ = monitor.baseline_for(runs[0], runs[1:])
+    assert baseline == 0  # five zeros out of eight: the median is dead
+
+
+def test_a_blessed_expectation_does_not_learn_the_outage():
+    runs = [execution(30, items=0)] + outage_history()
+    spec = {"name": "x", "watch_output": True, "expected_items": 50}
+    kinds = [a["kind"] for a in monitor.check_workflow(spec, runs, NOW)]
+    assert kinds == ["output_deviation"]
+
+
+def test_a_recovery_against_a_blessed_number_is_not_an_anomaly():
+    runs = [execution(30, items=52)] + outage_history()
+    spec = {"name": "x", "watch_output": True, "expected_items": 50}
+    assert monitor.check_workflow(spec, runs, NOW) == []
+
+
+def test_blessed_beats_thin_history():
+    """One prior run is not enough for a median but a blessed number needs none."""
+    runs = [execution(30, items=2), execution(90, items=50)]
+    spec = {"name": "x", "watch_output": True, "expected_items": 50}
+    kinds = [a["kind"] for a in monitor.check_workflow(spec, runs, NOW)]
+    assert kinds == ["output_deviation"]
+
+
+def test_the_floor_still_wins_over_the_blessed_number():
+    """min_items is a hard rule; one problem produces one alert."""
+    runs = [execution(30, items=3)] + outage_history()
+    spec = {"name": "x", "watch_output": True, "expected_items": 50, "min_items": 10}
+    kinds = [a["kind"] for a in monitor.check_workflow(spec, runs, NOW)]
+    assert kinds == ["below_floor"]
+
+
+def test_a_nonsense_blessed_value_is_ignored_not_crashed():
+    runs = [execution(30, items=52)] + outage_history()
+    for bad in (0, -5, "fifty", None):
+        spec = {"name": "x", "watch_output": True, "expected_items": bad}
+        monitor.check_workflow(spec, runs, NOW)  # must not raise or divide by zero
+
+
+def test_history_proposes_a_whole_number():
+    runs = [execution(30, items=52), execution(90, items=48),
+            execution(150, items=55), execution(210, items=51)]
+    assert monitor.propose_expectation(runs) == 52
+
+
+def test_nothing_is_proposed_from_thin_or_empty_history():
+    assert monitor.propose_expectation([]) is None
+    assert monitor.propose_expectation([execution(30, items=52)]) is None
+    assert monitor.propose_expectation(
+        [execution(30, items=52), execution(90, items=48)]) is None

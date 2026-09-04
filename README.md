@@ -48,6 +48,25 @@ The calendar point came from AleksGorbatov on the n8n forum, who maintains
 integrations for a dozen-plus clients: *"a baseline is an expectation with a
 calendar attached... averages hide exactly the days you care about."*
 
+## History proposes. You bless.
+
+The rolling median has a failure an n8n operator named precisely: *"a rolling
+learner will happily learn a two-week outage as the new normal."* Once an outage
+is longer than half the window, the dead runs *are* the median, and the recovery
+pages as the anomaly. The monitor was quietly wrong in exactly this way.
+
+The answer another operator gave is better than anything unsupervised: history
+**proposes** an expectation, a human **blesses** it, and a blessed expectation never
+drifts without another bless.
+
+`--scan` does the proposing. When it has enough history to have an opinion, the
+`watch.json` it prints carries `expected_items` for each workflow — the median of
+recent runs, rounded. Saving that file is the blessing. From then on deviation is
+measured against your number, not against whatever the last fortnight looked like.
+
+The trade is deliberate: a blessed number also does not follow a legitimate change
+until you change it. Run `--scan` again after editing a workflow and it re-proposes.
+
 ## Absence is a signal. So is presence.
 
 `watch_steps` catches a step that stopped running. It cannot catch the opposite,
@@ -163,8 +182,10 @@ can act on it:
 - `watch_steps` — alert when a step that normally runs stops running.
 - `watch_node_output` — alert when a step *runs*, reports success, and carries
   nothing. See below; this is the one that catches the green-but-empty node.
+- `expected_items` — a blessed baseline. When set, deviation is measured against
+  this number instead of the rolling median. See below for why you want one.
 - `min_items` — a hard floor, for when you genuinely know the number. Takes
-  precedence over deviation, so one problem produces one alert.
+  precedence over everything else, so one problem produces one alert.
 - `slack_webhook` — optional; without it, output goes to stdout only.
 
 Tuning constants live at the top of `monitor.py`: `GRACE` (how late is late),
