@@ -48,6 +48,47 @@ The calendar point came from AleksGorbatov on the n8n forum, who maintains
 integrations for a dozen-plus clients: *"a baseline is an expectation with a
 calendar attached... averages hide exactly the days you care about."*
 
+## Which rows are missing, not how many
+
+The strongest objection to every count-based check came from the person whose
+count-based check had already failed him. He pulls a bank statement, and his fix
+after the empty-pull incident was to alert on zero rows:
+
+> the 60 percent day is the one that got past me, count looked fine. what i watch
+> now is not how many rows but which ones are missing. a statement has the same
+> regulars every month, rent, salaries, two or three subscriptions. if they are not
+> in the pull then something got cut no matter what the total says. percentages
+> never caught that, missing names did.
+
+He is right, and no count fixes it. A pull can drop the rent line, pick up two new
+merchants, and land on exactly the normal total. The median agrees. A blessed
+`expected_items` agrees. Every number in this tool agrees, and the statement is
+wrong.
+
+So name the regulars:
+
+```json
+{
+  "name": "bank-feed",
+  "expect_present_field": "description",
+  "expect_present": ["Rent", "Salaries", "AWS"]
+}
+```
+
+Matching is case-insensitive substring, because real descriptions are dirty and
+`RENT PAYMENT 4421` has to satisfy `Rent`. Naming the field matters: *Rent*
+appearing in a memo column is not the rent line arriving, and the check says so.
+
+Two deliberate silences. If the field itself has vanished from every item, you get
+one alert saying that, rather than one per blessed value on top of a failure you
+already have. And an empty run produces nothing here at all, because zero rows is
+already reported by the count checks and saying it twice trains people to mute both.
+
+The honest cost: cancel a subscription and this alerts every run until you remove
+it from the list. That is the same trade as a blessed count, and the alert names the
+value so the edit takes seconds. There is no `--scan` proposal for this one. Only
+you know which lines are load-bearing, and a tool that guessed would bless noise.
+
 ## Monitoring that works looks like nothing happening
 
 An agency owner on r/n8n put it exactly: the first client he bundled monitoring
@@ -221,6 +262,9 @@ can act on it:
   this number instead of the rolling median. See below for why you want one.
 - `nodes` — the blessed node list. `--scan` writes it; `--report` names anything
   added or removed since.
+- `expect_present` — values that must appear in every run, and
+  `expect_present_field` to say which column to look in. Counts answer *how
+  many*. This answers *which ones*.
 - `min_items` — a hard floor, for when you genuinely know the number. Takes
   precedence over everything else, so one problem produces one alert.
 - `slack_webhook` — optional; without it, output goes to stdout only.

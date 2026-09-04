@@ -24,6 +24,10 @@ Usage:
     python monitor.py --scan      # check active workflows, no config needed
     python monitor.py --scan 100  # ... more of them; the default stops at 25
     python monitor.py --report watch.json [days]   # the month, in your units
+
+Config keys worth knowing: expected_items (a blessed count) and expect_present
+(blessed values that must appear in every run). Counts answer "how much";
+expect_present answers "which ones", and no count answers that.
     python monitor.py watch.json  # check the ones you have chosen to watch
 
 Start with --scan. It needs nothing but the two variables above, and it prints a
@@ -132,6 +136,23 @@ def median(values):
     return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
+def _terminal_runs(execution):
+    """The run records of the node named by lastNodeExecuted, or None.
+
+    One place knows this shape. item_count and terminal_items both read it, so
+    a change in n8n's execution format breaks one function rather than two.
+    """
+    result = ((execution or {}).get("data") or {}).get("resultData") or {}
+    run_data = result.get("runData")
+    if not isinstance(run_data, dict) or not run_data:
+        return None
+    last = result.get("lastNodeExecuted")
+    runs = run_data.get(last) if last else None
+    if not isinstance(runs, list) or not runs:
+        return None
+    return runs
+
+
 def item_count(execution):
     """How many items the LAST node to run emitted.
 
@@ -146,14 +167,8 @@ def item_count(execution):
     "unknown", which is deliberately different from 0, and we never alert on
     unknown.
     """
-    result = ((execution or {}).get("data") or {}).get("resultData") or {}
-    run_data = result.get("runData")
-    if not isinstance(run_data, dict) or not run_data:
-        return None
-
-    last = result.get("lastNodeExecuted")
-    runs = run_data.get(last) if last else None
-    if not isinstance(runs, list) or not runs:
+    runs = _terminal_runs(execution)
+    if runs is None:
         return None
 
     total = 0
@@ -167,6 +182,77 @@ def item_count(execution):
             if isinstance(branch, list):
                 total += len(branch)
     return total if seen_any else None
+
+
+def terminal_items(execution):
+    """The json payloads the terminal node emitted, or None if unreadable.
+
+    None means "we cannot see the output", which is deliberately different from
+    an empty list. We never alert on unknown.
+    """
+    runs = _terminal_runs(execution)
+    if runs is None:
+        return None
+
+    items, seen_any = [], False
+    for run in runs:
+        main = ((run or {}).get("data") or {}).get("main")
+        if not isinstance(main, list):
+            continue
+        seen_any = True
+        for branch in main:
+            if not isinstance(branch, list):
+                continue
+            for item in branch:
+                if isinstance(item, dict):
+                    payload = item.get("json")
+                    items.append(payload if isinstance(payload, dict) else {})
+    return items if seen_any else None
+
+
+def _searchable(item, field=None):
+    """The text of one item that a blessed value could appear in."""
+    if field is not None:
+        value = item.get(field)
+        return "" if value is None else str(value)
+    parts = []
+    for value in item.values():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (str, int, float)):
+            parts.append(str(value))
+    return "\n".join(parts)
+
+
+def missing_regulars(items, expected, field=None):
+    """Which blessed values are absent from this run. -> (missing, field_gone)
+
+    Reported by an agency owner running a bank-statement pull on r/n8n
+    (2026-09-04): "a statement has the same regulars every month, rent,
+    salaries, two or three subscriptions. If they are not in the pull then
+    something got cut no matter what the total says."
+
+    That is a different question from how many rows arrived, and no count
+    answers it. A pull can lose the rent line and gain two others, and every
+    total, median and blessed count still agrees with itself.
+
+    Matching is case-insensitive substring, because real descriptions are dirty:
+    "RENT PAYMENT 4421" has to satisfy "Rent". Returns no opinion at all when
+    the output is unreadable or empty -- emptiness belongs to the count checks,
+    and unknown belongs to nobody.
+    """
+    if items is None or not items or not expected:
+        return [], False
+
+    if field is not None and not any(field in item for item in items):
+        # The column itself is gone. Naming every blessed value as missing
+        # would be noise stacked on a different failure.
+        return [], True
+
+    hay = "\n".join(_searchable(item, field) for item in items).casefold()
+    missing = [v for v in expected
+               if str(v).strip().casefold() and str(v).strip().casefold() not in hay]
+    return missing, False
 
 
 def nodes_that_ran(execution):
@@ -760,6 +846,26 @@ def check_workflow(spec, executions, now, declared=None):
                         "detail": "produced 0 items and there is not enough "
                                   "history yet to know what normal looks like",
                     })
+
+    # --- 2b. are the rows that must always be there, actually there? ---
+    regulars = spec.get("expect_present")
+    if isinstance(regulars, list) and regulars:
+        missing, field_gone = missing_regulars(
+            terminal_items(latest), regulars, spec.get("expect_present_field"))
+        if field_gone:
+            alerts.append({
+                "workflow": name,
+                "kind": "expected_field_absent",
+                "detail": "no item has a '%s' field, so the regulars you listed "
+                          "cannot be checked" % spec.get("expect_present_field"),
+            })
+        elif missing:
+            alerts.append({
+                "workflow": name,
+                "kind": "regulars_missing",
+                "detail": "expected in every run but absent from this one: %s"
+                          % ", ".join("'%s'" % m for m in missing),
+            })
 
     # --- 3. did a step that normally runs quietly stop running? ---
     if spec.get("watch_steps"):

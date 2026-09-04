@@ -862,3 +862,106 @@ def test_scan_spec_blesses_the_node_list():
          "parameters": {"rule": {"interval": [{"field": "hours"}]}}},
         {"name": "Send", "type": "n8n-nodes-base.set"}]})
     assert spec["nodes"] == ["Send", "Trigger"]
+
+
+# --- the regulars: which rows are missing, not how many ----------------------
+#
+# "a statement has the same regulars every month, rent, salaries, two or three
+# subscriptions. if they are not in the pull then something got cut no matter
+# what the total says." The 60% day passed his row count; missing names caught it.
+
+
+def rows(*payloads):
+    """A successful run whose terminal node emitted these json payloads."""
+    return {
+        "id": "1", "status": "success",
+        "stoppedAt": (NOW - timedelta(minutes=30)).isoformat(),
+        "data": {"resultData": {
+            "lastNodeExecuted": "Last Node",
+            "runData": {
+                "Schedule Trigger": [{"data": {"main": [[{"json": {"t": 1}}]]}}],
+                "Last Node": [{"data": {"main": [
+                    [{"json": p} for p in payloads]]}}],
+            }}},
+    }
+
+
+STATEMENT = ["Rent", "Salaries", "AWS"]
+
+
+def test_terminal_items_returns_the_payloads_not_the_trigger():
+    got = monitor.terminal_items(rows({"description": "Rent"}, {"description": "AWS"}))
+    assert got == [{"description": "Rent"}, {"description": "AWS"}]
+
+
+def test_pruned_run_data_gives_no_opinion():
+    assert monitor.terminal_items(execution(30)) is None
+    assert monitor.missing_regulars(None, STATEMENT) == ([], False)
+
+
+def test_all_regulars_present_is_silent():
+    items = monitor.terminal_items(rows(
+        {"description": "Rent"}, {"description": "Salaries"}, {"description": "AWS"}))
+    assert monitor.missing_regulars(items, STATEMENT) == ([], False)
+
+
+def test_a_missing_regular_is_named():
+    items = monitor.terminal_items(rows(
+        {"description": "Rent"}, {"description": "AWS"}))
+    missing, gone = monitor.missing_regulars(items, STATEMENT)
+    assert missing == ["Salaries"] and gone is False
+
+
+def test_matching_is_case_insensitive_and_substring():
+    """Real descriptions are dirty. RENT PAYMENT 4421 has to satisfy Rent."""
+    items = monitor.terminal_items(rows(
+        {"description": "RENT PAYMENT 4421"},
+        {"description": "  monthly salaries  "},
+        {"description": "aws emea billing"}))
+    assert monitor.missing_regulars(items, STATEMENT) == ([], False)
+
+
+def test_the_count_can_be_perfectly_normal_and_a_regular_still_missing():
+    """The whole point. Three rows in, three rows out, one of them wrong."""
+    spec = {"name": "bank-feed", "watch_output": True, "expected_items": 3,
+            "expect_present": STATEMENT, "expect_present_field": "description"}
+    run = rows({"description": "Rent"}, {"description": "AWS"},
+               {"description": "Some new merchant"})
+    alerts = monitor.check_workflow(spec, [run], NOW)
+    kinds = [a["kind"] for a in alerts]
+    assert "output_deviation" not in kinds
+    assert "regulars_missing" in kinds
+    assert "Salaries" in [a for a in alerts if a["kind"] == "regulars_missing"][0]["detail"]
+
+
+def test_the_named_field_vanishing_is_its_own_alert_not_three_missing_values():
+    items = monitor.terminal_items(rows({"desc": "Rent"}, {"desc": "Salaries"}))
+    missing, gone = monitor.missing_regulars(items, STATEMENT, field="description")
+    assert gone is True and missing == []
+
+
+def test_searching_a_named_field_ignores_a_match_in_another_column():
+    """'Rent' appearing in a memo column is not the rent line arriving."""
+    items = monitor.terminal_items(rows(
+        {"description": "AWS", "memo": "Rent was paid last month"},
+        {"description": "Salaries", "memo": ""}))
+    missing, _ = monitor.missing_regulars(items, STATEMENT, field="description")
+    assert missing == ["Rent"]
+
+
+def test_with_no_field_named_any_column_counts():
+    items = monitor.terminal_items(rows(
+        {"payee": "Rent"}, {"note": "Salaries"}, {"x": "AWS"}))
+    assert monitor.missing_regulars(items, STATEMENT) == ([], False)
+
+
+def test_an_empty_run_belongs_to_the_count_checks_not_this_one():
+    """Zero rows is already reported once. Do not report it three more times."""
+    empty = monitor.terminal_items(rows())
+    assert monitor.missing_regulars(empty, STATEMENT) == ([], False)
+
+
+def test_no_blessed_list_means_no_check():
+    run = rows({"description": "anything"})
+    alerts = monitor.check_workflow({"name": "x", "watch_output": True}, [run], NOW)
+    assert [a for a in alerts if a["kind"] == "regulars_missing"] == []
