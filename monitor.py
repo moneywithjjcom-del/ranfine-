@@ -25,9 +25,10 @@ Usage:
     python monitor.py --scan 100  # ... more of them; the default stops at 25
     python monitor.py --report watch.json [days]   # the month, in your units
 
-Config keys worth knowing: expected_items (a blessed count) and expect_present
-(blessed values that must appear in every run). Counts answer "how much";
-expect_present answers "which ones", and no count answers that.
+Config keys worth knowing: expected_items (a blessed count), expect_present
+(values that must appear in EVERY run) and expect_within_days (values that need
+not be in every run but must turn up inside a window). Counts answer "how much";
+the other two answer "which ones", and no count answers that.
     python monitor.py watch.json  # check the ones you have chosen to watch
 
 Start with --scan. It needs nothing but the two variables above, and it prints a
@@ -277,6 +278,43 @@ def regular_history(executions, expected, field=None, limit=HISTORY):
             if needle and needle in hay:
                 counts[v] += 1
     return counts, readable
+
+
+def value_seen_within(executions, value, days, now, field=None, limit=HISTORY):
+    """Did this value appear in any readable run inside the window?
+
+    Returns (seen, covered). `covered` is False when the readable history does
+    not reach back to the start of the window, and then `seen` carries no
+    information at all: not finding a monthly line in thirty hours of runs says
+    nothing about the month. Callers must not alert on an uncovered window.
+    """
+    needle = str(value).strip().casefold()
+    if not needle or not days:
+        return True, False
+
+    since = now - timedelta(days=float(days))
+    seen = False
+    oldest = None
+
+    for e in executions[:limit]:
+        items = terminal_items(e)
+        if items is None or not items:
+            continue
+        if field is not None and not any(field in item for item in items):
+            continue
+        when = parse_time(e.get("stoppedAt") or e.get("startedAt"))
+        if when is None:
+            continue
+        if oldest is None or when < oldest:
+            oldest = when
+        if when < since:
+            continue
+        hay = "\n".join(_searchable(item, field) for item in items).casefold()
+        if needle in hay:
+            seen = True
+
+    covered = oldest is not None and oldest <= since
+    return seen, covered
 
 
 def nodes_that_ran(execution):
@@ -933,6 +971,40 @@ def check_workflow(spec, executions, now, declared=None):
                     "detail": "expected in every run but absent from this one: "
                               "%s%s" % (", ".join("'%s'" % m for m in gone), seen),
                 })
+
+    # --- 2c. things that need not be in every run, but must turn up ---
+    # His second list. A monthly line in an hourly pull belongs here, not above.
+    windows = spec.get("expect_within_days")
+    if isinstance(windows, dict) and windows:
+        field = spec.get("expect_present_field")
+        overdue, blind = [], []
+        for value, days in sorted(windows.items()):
+            seen, covered = value_seen_within(executions, value, days, now, field)
+            if seen:
+                continue
+            if covered:
+                overdue.append((value, days))
+            else:
+                blind.append((value, days))
+        if overdue:
+            alerts.append({
+                "workflow": name,
+                "kind": "window_value_overdue",
+                "detail": "not seen inside its window: %s"
+                          % ", ".join("'%s' (%g days)" % (v, float(d))
+                                      for v, d in overdue),
+            })
+        if blind:
+            # Saying nothing here would be the failure this tool exists to
+            # catch: a check that quietly is not running.
+            alerts.append({
+                "workflow": name,
+                "kind": "window_not_covered",
+                "detail": "cannot check %s - the last %d runs do not reach back "
+                          "that far. Shorten the window or raise HISTORY"
+                          % (", ".join("'%s' (%g days)" % (v, float(d))
+                                       for v, d in blind), HISTORY),
+            })
 
     # --- 3. did a step that normally runs quietly stop running? ---
     if spec.get("watch_steps"):

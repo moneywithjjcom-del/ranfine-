@@ -116,6 +116,45 @@ stale until you edit it. That is the right kind of nagging, because the fix is o
 line and it is yours to make. There is no `--scan` proposal for this one. Only you
 know which lines are load-bearing, and a tool that guessed would bless noise.
 
+## Two lists, because one was wrong
+
+Telling someone a monthly line does not belong in a list of values expected in
+every run is true and, on its own, useless. The rent line still matters. Nothing
+was watching it. The operator who found that hole also brought the fix:
+
+> i stopped keeping one list and keep two now. things that must be in every run,
+> and things that must show up at least once inside a window.
+
+So there are two:
+
+```json
+{
+  "name": "bank-feed",
+  "expect_present_field": "description",
+  "expect_present": ["Salaries", "AWS"],
+  "expect_within_days": { "Rent": 35, "Payroll": 16 }
+}
+```
+
+The first list is checked against the latest run. The second asks a different
+question: has this turned up at all lately? A per-run check cannot see a monthly
+value, and neither can any count.
+
+**The honest limit, which matters more than the feature.** The tool reads a bounded
+number of recent runs. Thirty runs of an hourly workflow is thirty hours, and thirty
+hours cannot answer a question about thirty-five days. So the check works out
+whether its history actually reaches back to the start of the window, and if it does
+not, it refuses to give a verdict and tells you instead:
+
+```
+cannot check 'Rent' (35 days) - the last 30 runs do not reach back that far.
+Shorten the window or raise HISTORY
+```
+
+That message exists because a check that quietly is not running is the precise
+failure this whole tool is about. Reporting "rent never arrived" on thirty hours of
+evidence would be the same lie with an alert attached.
+
 ## Monitoring that works looks like nothing happening
 
 An agency owner on r/n8n put it exactly: the first client he bundled monitoring
@@ -292,6 +331,8 @@ can act on it:
 - `expect_present` — values that must appear in every run, and
   `expect_present_field` to say which column to look in. Counts answer *how
   many*. This answers *which ones*.
+- `expect_within_days` — values that need not be in every run but must turn up
+  inside a window, as `{"Rent": 35}`.
 - `min_items` — a hard floor, for when you genuinely know the number. Takes
   precedence over everything else, so one problem produces one alert.
 - `slack_webhook` — optional; without it, output goes to stdout only.

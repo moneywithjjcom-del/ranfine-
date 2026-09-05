@@ -1082,3 +1082,89 @@ def test_stale_and_genuine_missing_can_both_be_reported_at_once():
     assert "regulars_stale" in ks and "regulars_missing" in ks
     assert "'AWS'" in detail_of(spec, runs, "regulars_stale")
     assert "'Salaries'" in detail_of(spec, runs, "regulars_missing")
+
+
+# --- the second list: values that need not be in every run -------------------
+#
+# "i stopped keeping one list and keep two now. things that must be in every
+# run, and things that must show up at least once inside a window."
+#   - u/No-Hold-6217, r/n8n, 2026-09-05
+
+
+def statement_hours_ago(hours, *names):
+    return rows_at(hours * 60, *[{"description": n} for n in names])
+
+
+MONTHLY = {"name": "bank-feed", "expect_present_field": "description",
+           "expect_within_days": {"Rent": 35}}
+
+
+def test_a_monthly_line_seen_inside_the_window_is_silent():
+    runs = [statement_hours_ago(h, "AWS") for h in range(1, 20)]
+    runs.append(statement_hours_ago(24 * 10, "Rent"))
+    runs.append(statement_hours_ago(24 * 40, "AWS"))     # reaches past 35 days
+    assert monitor.value_seen_within(runs, "Rent", 35, NOW, "description") == (True, True)
+    assert "window_value_overdue" not in kinds_of(MONTHLY, runs)
+
+
+def test_a_monthly_line_absent_across_a_covered_window_alarms():
+    runs = [statement_hours_ago(24 * d, "AWS") for d in range(0, 45, 3)]
+    seen, covered = monitor.value_seen_within(runs, "Rent", 35, NOW, "description")
+    assert seen is False and covered is True
+    assert "window_value_overdue" in kinds_of(MONTHLY, runs)
+    assert "'Rent'" in detail_of(MONTHLY, runs, "window_value_overdue")
+
+
+def test_history_that_cannot_reach_the_window_gives_no_verdict():
+    """Thirty hours of an hourly workflow says nothing about a month."""
+    runs = [statement_hours_ago(h, "AWS") for h in range(1, 25)]
+    seen, covered = monitor.value_seen_within(runs, "Rent", 35, NOW, "description")
+    assert seen is False and covered is False
+    ks = kinds_of(MONTHLY, runs)
+    assert "window_value_overdue" not in ks
+    assert "window_not_covered" in ks
+
+
+def test_the_uncovered_message_says_what_to_do_about_it():
+    runs = [statement_hours_ago(h, "AWS") for h in range(1, 25)]
+    d = detail_of(MONTHLY, runs, "window_not_covered")
+    assert "do not reach back" in d and "Shorten the window" in d
+
+
+def test_seen_just_outside_the_window_does_not_count_as_seen():
+    runs = [statement_hours_ago(24 * d, "AWS") for d in range(0, 45, 3)]
+    runs.append(statement_hours_ago(24 * 36, "Rent"))
+    seen, covered = monitor.value_seen_within(runs, "Rent", 35, NOW, "description")
+    assert seen is False and covered is True
+
+
+def test_pruned_runs_never_extend_coverage():
+    """A run we cannot read proves nothing, including about how far back we see."""
+    runs = [statement_hours_ago(h, "AWS") for h in range(1, 10)]
+    runs += [execution(24 * 60 * d) for d in range(30, 50)]
+    seen, covered = monitor.value_seen_within(runs, "Rent", 35, NOW, "description")
+    assert covered is False
+
+
+def test_the_window_check_respects_the_named_field():
+    runs = [rows_at(24 * 60 * d, {"description": "AWS", "memo": "Rent paid"})
+            for d in range(0, 45, 3)]
+    seen, _ = monitor.value_seen_within(runs, "Rent", 35, NOW, "description")
+    assert seen is False
+
+
+def test_no_window_config_means_no_window_check():
+    runs = [statement_hours_ago(h, "AWS") for h in range(1, 25)]
+    ks = kinds_of({"name": "x", "expect_present_field": "description"}, runs)
+    assert "window_value_overdue" not in ks and "window_not_covered" not in ks
+
+
+def test_the_two_lists_are_independent():
+    """A value in the window list must not be required in every run."""
+    spec = {"name": "bank", "expect_present_field": "description",
+            "expect_present": ["AWS"], "expect_within_days": {"Rent": 35}}
+    runs = [statement_hours_ago(24 * d, "AWS") for d in range(0, 45, 3)]
+    runs.insert(1, statement_hours_ago(24 * 5, "AWS", "Rent"))
+    ks = kinds_of(spec, runs)
+    assert "regulars_missing" not in ks and "regulars_stale" not in ks
+    assert "window_value_overdue" not in ks
