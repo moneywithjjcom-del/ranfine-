@@ -84,10 +84,37 @@ one alert saying that, rather than one per blessed value on top of a failure you
 already have. And an empty run produces nothing here at all, because zero rows is
 already reported by the count checks and saying it twice trains people to mute both.
 
-The honest cost: cancel a subscription and this alerts every run until you remove
-it from the list. That is the same trade as a blessed count, and the alert names the
-value so the edit takes seconds. There is no `--scan` proposal for this one. Only
-you know which lines are load-bearing, and a tool that guessed would bless noise.
+### A stale list is worse than no list
+
+The first person to use this told us what breaks it, one day after it shipped:
+
+> watch out for the list going stale though. one of mine renamed itself and the
+> check cried every morning until i stopped reading it.
+
+That is the failure that kills monitors. A renamed row is absent from every run
+from now on, so a naive check repeats the same alert daily until the person mutes
+it, and a muted check hides the real failures too.
+
+So the tool looks at how often each value appeared in the runs before this one,
+and says something different depending on the answer:
+
+- **Never appeared in any run we can read.** It was renamed or retired. You get
+  one line telling you to update the list, saying plainly that it will repeat
+  until you do. That is an instruction you can act on, not an alarm.
+- **Appeared in only some runs.** It is not something every run produces, so it
+  does not belong in a list of values expected in every run. This catches a hole
+  we shipped without noticing: a monthly line in an hourly pull would otherwise
+  have alerted on nearly every run.
+- **Appeared in the runs before this one and is absent now.** That is the real
+  alarm, and it tells you how many of the recent runs had it.
+
+Pruned history is never counted as absence, and with too little readable history
+the check reports the bare fact and claims nothing about the cause.
+
+The honest cost that remains: cancel a subscription and this tells you the list is
+stale until you edit it. That is the right kind of nagging, because the fix is one
+line and it is yours to make. There is no `--scan` proposal for this one. Only you
+know which lines are load-bearing, and a tool that guessed would bless noise.
 
 ## Monitoring that works looks like nothing happening
 

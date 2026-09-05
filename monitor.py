@@ -255,6 +255,30 @@ def missing_regulars(items, expected, field=None):
     return missing, False
 
 
+def regular_history(executions, expected, field=None, limit=HISTORY):
+    """How many readable runs contained each blessed value. -> (counts, readable)
+
+    A run is "readable" only if we can see its items at all, and only if the
+    named field is present in them. Pruned history is not evidence of absence,
+    so it is not counted either way.
+    """
+    counts = dict((v, 0) for v in expected)
+    readable = 0
+    for e in executions[:limit]:
+        items = terminal_items(e)
+        if items is None or not items:
+            continue
+        if field is not None and not any(field in item for item in items):
+            continue
+        readable += 1
+        hay = "\n".join(_searchable(item, field) for item in items).casefold()
+        for v in expected:
+            needle = str(v).strip().casefold()
+            if needle and needle in hay:
+                counts[v] += 1
+    return counts, readable
+
+
 def nodes_that_ran(execution):
     """Names of the nodes present in this execution's run data.
 
@@ -860,12 +884,55 @@ def check_workflow(spec, executions, now, declared=None):
                           "cannot be checked" % spec.get("expect_present_field"),
             })
         elif missing:
-            alerts.append({
-                "workflow": name,
-                "kind": "regulars_missing",
-                "detail": "expected in every run but absent from this one: %s"
-                          % ", ".join("'%s'" % m for m in missing),
-            })
+            # A value missing from THIS run and from every run before it was
+            # almost certainly renamed, not lost. Saying "missing" every day
+            # about a thing that is never coming back is how a monitor teaches
+            # you to ignore it. Raised by u/No-Hold-6217, who muted his own.
+            counts, readable = regular_history(
+                executions[1:], missing, spec.get("expect_present_field"))
+
+            if readable >= MIN_HISTORY:
+                stale = [m for m in missing if counts[m] == 0]
+                rare = [m for m in missing
+                        if 0 < counts[m] * 2 < readable]
+                gone = [m for m in missing if m not in stale and m not in rare]
+            else:
+                # Not enough history to claim anything about why. Report the
+                # plain fact and stay quiet about the cause.
+                stale, rare, gone = [], [], missing
+
+            if stale:
+                alerts.append({
+                    "workflow": name,
+                    "kind": "regulars_stale",
+                    "detail": "%s never appeared in any of the last %d runs, so "
+                              "it was probably renamed or retired. Update the "
+                              "list - this will not fix itself and will repeat "
+                              "every run until you do"
+                              % (", ".join("'%s'" % m for m in stale), readable),
+                })
+            if rare:
+                alerts.append({
+                    "workflow": name,
+                    "kind": "regulars_irregular",
+                    "detail": "%s appears in only some runs (%s of the last %d), "
+                              "so it is not something every run produces and "
+                              "probably does not belong in expect_present"
+                              % (", ".join("'%s'" % m for m in rare),
+                                 ", ".join(str(counts[m]) for m in rare),
+                                 readable),
+                })
+            if gone:
+                seen = ""
+                if readable >= MIN_HISTORY:
+                    seen = " (present in %s of the last %d)" % (
+                        ", ".join(str(counts[m]) for m in gone), readable)
+                alerts.append({
+                    "workflow": name,
+                    "kind": "regulars_missing",
+                    "detail": "expected in every run but absent from this one: "
+                              "%s%s" % (", ".join("'%s'" % m for m in gone), seen),
+                })
 
     # --- 3. did a step that normally runs quietly stop running? ---
     if spec.get("watch_steps"):

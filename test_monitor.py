@@ -965,3 +965,120 @@ def test_no_blessed_list_means_no_check():
     run = rows({"description": "anything"})
     alerts = monitor.check_workflow({"name": "x", "watch_output": True}, [run], NOW)
     assert [a for a in alerts if a["kind"] == "regulars_missing"] == []
+
+
+# --- a stale list must not cry wolf ------------------------------------------
+#
+# "watch out for the list going stale though. one of mine renamed itself and
+# the check cried every morning until i stopped reading it." - u/No-Hold-6217,
+# one day after expect_present shipped. A monitor that repeats an alert nobody
+# can action is worse than no monitor, because it hides the real ones too.
+
+
+def rows_at(minutes_ago, *payloads):
+    """A successful run at a given age whose terminal node emitted these rows."""
+    return {
+        "id": "1", "status": "success",
+        "stoppedAt": (NOW - timedelta(minutes=minutes_ago)).isoformat(),
+        "data": {"resultData": {
+            "lastNodeExecuted": "Last Node",
+            "runData": {
+                "Schedule Trigger": [{"data": {"main": [[{"json": {"t": 1}}]]}}],
+                "Last Node": [{"data": {"main": [
+                    [{"json": pl} for pl in payloads]]}}],
+            }}},
+    }
+
+
+def statement(minutes_ago, *names):
+    return rows_at(minutes_ago, *[{"description": n} for n in names])
+
+
+BANK = {"name": "bank-feed", "expect_present": ["Rent", "Salaries", "AWS"],
+        "expect_present_field": "description"}
+
+
+def kinds_of(spec, runs):
+    return [a["kind"] for a in monitor.check_workflow(spec, runs, NOW)]
+
+
+def detail_of(spec, runs, kind):
+    return [a["detail"] for a in monitor.check_workflow(spec, runs, NOW)
+            if a["kind"] == kind][0]
+
+
+def test_a_renamed_line_is_reported_as_stale_not_missing():
+    """Absent from this run AND from every run before it. Fix the list."""
+    runs = [statement(30 * (k + 1), "Rent", "Salaries") for k in range(6)]
+    assert "regulars_stale" in kinds_of(BANK, runs)
+    assert "regulars_missing" not in kinds_of(BANK, runs)
+
+
+def test_the_stale_alert_says_it_will_repeat_until_the_list_is_fixed():
+    runs = [statement(30 * (k + 1), "Rent", "Salaries") for k in range(6)]
+    d = detail_of(BANK, runs, "regulars_stale")
+    assert "'AWS'" in d and "renamed" in d and "Update the list" in d
+
+
+def test_a_line_that_was_there_yesterday_and_is_gone_today_still_alarms():
+    runs = [statement(30, "Rent", "AWS")] + [
+        statement(30 * (k + 2), "Rent", "Salaries", "AWS") for k in range(5)]
+    assert "regulars_missing" in kinds_of(BANK, runs)
+    assert "regulars_stale" not in kinds_of(BANK, runs)
+    assert "'Salaries'" in detail_of(BANK, runs, "regulars_missing")
+
+
+def test_the_real_alarm_shows_how_often_it_used_to_appear():
+    runs = [statement(30, "Rent", "AWS")] + [
+        statement(30 * (k + 2), "Rent", "Salaries", "AWS") for k in range(5)]
+    assert "present in 5 of the last 5" in detail_of(BANK, runs, "regulars_missing")
+
+
+def test_a_value_that_only_appears_sometimes_is_called_out_as_not_a_regular():
+    """A monthly line in an hourly pull. We shipped this hole yesterday."""
+    runs = [statement(30, "Rent", "AWS")] + \
+           [statement(60, "Rent", "Salaries", "AWS")] + \
+           [statement(30 * (k + 3), "Rent", "AWS") for k in range(6)]
+    assert "regulars_irregular" in kinds_of(BANK, runs)
+    d = detail_of(BANK, runs, "regulars_irregular")
+    assert "'Salaries'" in d and "does not belong in expect_present" in d
+
+
+def test_too_little_readable_history_claims_nothing_about_the_cause():
+    runs = [statement(30, "Rent", "AWS"), statement(60, "Rent", "AWS")]
+    ks = kinds_of(BANK, runs)
+    assert "regulars_missing" in ks
+    assert "regulars_stale" not in ks and "regulars_irregular" not in ks
+    assert "of the last" not in detail_of(BANK, runs, "regulars_missing")
+
+
+def test_pruned_runs_are_not_counted_as_absence():
+    """n8n pruning history must never be read as the value disappearing."""
+    runs = [statement(30, "Rent", "AWS")] + [execution(30 * (k + 2)) for k in range(8)]
+    ks = kinds_of(BANK, runs)
+    assert "regulars_stale" not in ks
+    assert "regulars_missing" in ks
+
+
+def test_history_counting_ignores_runs_whose_field_is_gone():
+    hist = [rows_at(60, {"desc": "Rent"}), rows_at(90, {"description": "Rent"})]
+    counts, readable = monitor.regular_history(hist, ["Rent"], field="description")
+    assert readable == 1 and counts["Rent"] == 1
+
+
+def test_history_counting_matches_the_same_way_the_check_does():
+    hist = [statement(60, "RENT PAYMENT 4421"), statement(90, "rent")]
+    counts, readable = monitor.regular_history(hist, ["Rent"], field="description")
+    assert readable == 2 and counts["Rent"] == 2
+
+
+def test_stale_and_genuine_missing_can_both_be_reported_at_once():
+    """One renamed line and one real disappearance are different problems."""
+    spec = {"name": "bank", "expect_present": ["Rent", "Salaries", "AWS"],
+            "expect_present_field": "description"}
+    runs = [statement(30, "Rent")] + [
+        statement(30 * (k + 2), "Rent", "Salaries") for k in range(5)]
+    ks = kinds_of(spec, runs)
+    assert "regulars_stale" in ks and "regulars_missing" in ks
+    assert "'AWS'" in detail_of(spec, runs, "regulars_stale")
+    assert "'Salaries'" in detail_of(spec, runs, "regulars_missing")
