@@ -135,6 +135,33 @@ CASES = [
          source="RomeoApps (308708) receipt health; KSD downstream check",
          spec=HOURLY, runs=hourly([12] * 9)),
 
+    # ---- defect classes enzosoftware measured as HIS misses ---------------
+    # Handed over on 308708 with an explicit invitation to test them. He found
+    # these by shipping five products broken and keeping the archives, which is
+    # a corpus nobody would design on purpose. All three are STATIC defects in
+    # the workflow, and every check here reads execution history instead, so
+    # they test the seam between the two approaches rather than our detectors.
+
+    dict(label="broken", name="payload in bodyParameters, API wanted raw body",
+         source="enzosoftware (308708): six of his eleven misses, one class",
+         # Broken since the first run: there is no healthy baseline to deviate
+         # from, which is the shape a static defect always takes in production.
+         spec=HOURLY, runs=hourly([0] * 9)),
+
+    dict(label="broken", name="$input.item.json read after an HTTP call",
+         source="enzosoftware (308708): four misses; the row written holds the "
+                "API response, not the original record",
+         # The count is right and stays right. Only the contents are wrong, and
+         # they have been wrong since day one.
+         spec=HOURLY,
+         runs=[run(30 + i * 60, fields=[{"status": "ok"}] * 12)
+               for i in range(0, 9)]),
+
+    dict(label="broken", name="fragile JSON parse of a model reply",
+         source="enzosoftware (308708): his one miss he believes undetectable",
+         # Intermittent: most runs fine, this one wrote a short batch.
+         spec=HOURLY, runs=hourly([11, 12, 12, 11, 12, 12, 13, 12])),
+
     # ---- healthy: these must stay silent ----------------------------------
     dict(label="healthy", name="ordinary run, stable volume",
          spec=HOURLY, runs=hourly([12, 11, 12, 13, 12, 12, 11, 12])),
