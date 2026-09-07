@@ -96,6 +96,12 @@ HISTORY = 30
 SCAN_HISTORY = 12
 SCAN_LIMIT = 25
 
+# A scan that flags most of an instance is more likely a broken check than a
+# broken instance. Below SCAN_HIT_FLOOR workflows the proportion means nothing,
+# so the warning stays quiet rather than firing on a two-workflow scan.
+SCAN_HIT_FLOOR = 5
+SCAN_HIT_RATE = 0.5
+
 # The monthly report pulls run data for a whole window, which is the one place
 # this tool is allowed to be expensive - it runs once a month, on purpose, by a
 # person. Still bounded, and the bound is named in the output when it bites.
@@ -1136,6 +1142,40 @@ def load_env_file(path=".env"):
         pass  # no file is a normal, supported case
 
 
+def hit_rate_warning(alerts, scanned, floor=SCAN_HIT_FLOOR,
+                     threshold=SCAN_HIT_RATE):
+    """Say so when the scan flags so much of an instance that it suspects itself.
+
+    Raised by enzosoftware on community.n8n.io, who pointed a static scanner at
+    3,138 published templates and had 58 of the first 83 come back positive.
+    Every one was a fault in the check, not in the workflow. His conclusion is
+    the useful part: a hit rate is itself a diagnostic, and a check firing on
+    most of a population you believe is mostly healthy is telling you about
+    itself.
+
+    Counts WORKFLOWS, not alerts. One badly broken workflow can raise five
+    findings, and calling that a five-workflow hit rate would fire this warning
+    on exactly the instance where the tool is working correctly.
+
+    Deliberately not a verdict. A single instance really can be mostly broken,
+    which is not true of a corpus of other people's templates, so this names the
+    two ways to tell the cases apart and leaves the judgement with the operator.
+    Returns None when there is nothing worth saying.
+    """
+    if scanned < floor:
+        return None
+    flagged = len({a.get("workflow") for a in alerts if a.get("workflow")})
+    if flagged < threshold * scanned:
+        return None
+    return (
+        "%d of the %d workflows scanned came back with a finding (%d%%).\n"
+        "That is a high enough share to suspect this check before believing it.\n"
+        "Two ways to tell which: confirm one finding by hand against that\n"
+        "workflow's execution list, and include a workflow you know is healthy\n"
+        "in the next scan. If the healthy one is flagged too, the fault is here."
+        % (flagged, scanned, round(100.0 * flagged / scanned)))
+
+
 def scan(base, api_key, now, limit=SCAN_LIMIT):
     """Check active workflows with sensible defaults and no config file.
 
@@ -1181,6 +1221,9 @@ def scan(base, api_key, now, limit=SCAN_LIMIT):
 
     print("")
     print(format_report(alerts))
+    suspect = hit_rate_warning(alerts, len(workflows))
+    if suspect:
+        print("\n" + suspect)
     if skipped:
         print("\nNot checked (%d over the limit of %d): %s"
               % (len(skipped), limit,

@@ -1168,3 +1168,43 @@ def test_the_two_lists_are_independent():
     ks = kinds_of(spec, runs)
     assert "regulars_missing" not in ks and "regulars_stale" not in ks
     assert "window_value_overdue" not in ks
+
+
+# --- the check that suspects itself ---------------------------------------
+# Raised by enzosoftware on community.n8n.io: a hit rate is itself a diagnostic.
+# Four of these five are silence assertions, which is his other point - the
+# quiet cases are the ones that catch the next false positive.
+
+def flags(*names):
+    return [{"workflow": n, "kind": "x", "detail": "y"} for n in names]
+
+
+def test_a_scan_flagging_most_of_the_instance_says_so():
+    warning = monitor.hit_rate_warning(flags("a", "b", "c"), 5)
+    assert warning is not None
+    assert "3 of the 5" in warning and "60%" in warning
+
+
+def test_a_normal_hit_rate_stays_quiet():
+    assert monitor.hit_rate_warning(flags("a"), 5) is None
+
+
+def test_a_clean_scan_stays_quiet():
+    assert monitor.hit_rate_warning([], 9) is None
+
+
+def test_a_small_scan_stays_quiet_however_bad_it_looks():
+    """Two of two is 100% and means nothing. Do not cry wolf on a tiny sample."""
+    assert monitor.hit_rate_warning(flags("a", "b"), 2) is None
+
+
+def test_many_findings_on_one_workflow_are_not_a_hit_rate():
+    """The count is workflows, not alerts.
+
+    One thoroughly broken workflow raising five findings out of six scanned is
+    the tool working, not the tool failing. Counting alerts here would fire the
+    warning on exactly the run we most want believed.
+    """
+    alerts = [{"workflow": "a", "kind": k, "detail": "y"}
+              for k in ("stalled", "empty", "shape", "regulars_missing", "drift")]
+    assert monitor.hit_rate_warning(alerts, 6) is None
