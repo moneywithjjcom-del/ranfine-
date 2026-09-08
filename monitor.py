@@ -50,6 +50,10 @@ watch.json at the end if you want to keep going.
 `watch_output` turns on deviation detection. `min_items` adds a hard floor on
 top of it, for the cases where you genuinely know the number.
 
+Set HEARTBEAT_URL to a ping URL from Healthchecks.io, Cronitor or similar and
+this tool will hit it after every completed run. That is how you find out the
+CHECK stopped, which is a failure shaped exactly like good news.
+
 NOTE ON SCOPE: the heartbeat below is the commoditised part -- Healthchecks.io
 and Cronitor already do dead-man's switches, and do them well. What they cannot
 do is look *inside* an n8n execution. The output checks are the part worth
@@ -1261,6 +1265,40 @@ def report(base, api_key, config, now, days=REPORT_DAYS):
     return rows
 
 
+def report_own_liveness(url=None, opener=urllib.request.urlopen):
+    """Tell an outside service this check ran, so its silence is detectable.
+
+    Raised by DuskWatch on community.n8n.io as the state underneath the three
+    this tool already distinguishes: the check did not execute at all. A check
+    that stops produces nothing, and nothing is exactly what all-clear looks
+    like. Their words, and they are right: a muted alarm at least still emits a
+    line somebody chose to ignore.
+
+    This does NOT implement a dead-man's switch. Healthchecks.io and Cronitor
+    already do that well, which is said elsewhere in this file, so the correct
+    move is to be watched by one rather than to build another. Set HEARTBEAT_URL
+    to a ping URL from whichever you use.
+
+    Called only after a run completes. A crashed run must not ping, because the
+    whole value is that silence means something.
+
+    A failed ping is printed, never raised, and never changes the exit code: an
+    alert about your workflows must not be lost because a third-party ping
+    endpoint was briefly down. But it is printed rather than swallowed, because
+    a heartbeat failing quietly is the same disease one layer further out.
+    """
+    url = url if url is not None else os.environ.get("HEARTBEAT_URL", "").strip()
+    if not url:
+        return False
+    try:
+        opener(url, timeout=10).close()
+        return True
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print("heartbeat ping failed (%s): this run completed, but nothing "
+              "outside it knows that" % exc, file=sys.stderr)
+        return False
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
@@ -1303,6 +1341,7 @@ def main(argv):
                       "save the file: once set they do not drift, which is the "
                       "point, so a wrong one stays wrong until you change it.")
             print(json.dumps({"workflows": specs}, indent=2))
+        report_own_liveness()
         return 1 if alerts else 0
 
     config = json.loads(open(config_path, encoding="utf-8").read())
@@ -1319,6 +1358,7 @@ def main(argv):
         for r in rows:
             if r.get("error"):
                 print("  ! %s: %s" % (r["workflow"], r["error"]), file=sys.stderr)
+        report_own_liveness()
         return 1 if any(r.get("error") for r in rows) else 0
 
     alerts = []
@@ -1355,6 +1395,7 @@ def main(argv):
             print("could not post to Slack: %s" % exc, file=sys.stderr)
             return 1
 
+    report_own_liveness()
     return 1 if alerts else 0
 
 

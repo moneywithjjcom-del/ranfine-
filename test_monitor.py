@@ -1208,3 +1208,42 @@ def test_many_findings_on_one_workflow_are_not_a_hit_rate():
     alerts = [{"workflow": "a", "kind": k, "detail": "y"}
               for k in ("stalled", "empty", "shape", "regulars_missing", "drift")]
     assert monitor.hit_rate_warning(alerts, 6) is None
+
+
+# --- telling the outside world this check ran ------------------------------
+# Raised by DuskWatch on community.n8n.io: underneath the three states above
+# sits a fourth, the check did not run at all, and its silence is shaped
+# exactly like all-clear.
+
+def collector():
+    seen = []
+
+    def opener(url, timeout=None):
+        seen.append(url)
+
+        class R:
+            def close(self):
+                pass
+        return R()
+    return seen, opener
+
+
+def test_no_heartbeat_url_means_no_ping():
+    """Silence must stay opt-in. Nobody gets pinged by installing this."""
+    seen, opener = collector()
+    assert monitor.report_own_liveness("", opener) is False
+    assert seen == []
+
+
+def test_a_configured_heartbeat_is_pinged_once():
+    seen, opener = collector()
+    assert monitor.report_own_liveness("https://hc.example/abc", opener) is True
+    assert seen == ["https://hc.example/abc"]
+
+
+def test_a_failed_ping_never_raises():
+    """An alert about your workflows must not be lost because a third-party
+    ping endpoint was down for a minute."""
+    def boom(url, timeout=None):
+        raise OSError("connection refused")
+    assert monitor.report_own_liveness("https://hc.example/abc", boom) is False
