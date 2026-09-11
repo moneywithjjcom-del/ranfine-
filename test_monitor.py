@@ -1344,3 +1344,63 @@ def test_check_workflow_without_a_definition_is_unchanged():
         {"workflow": "pull", "kind": "never_ran",
          "detail": "no successful execution on record -- if this was just "
                    "published, check the trigger actually fires on its own"}]
+
+
+def test_scan_actually_reports_static_defects():
+    """The wiring test, not the logic test.
+
+    static_findings() passed its own tests and the corpus while being
+    unreachable from every production path: scan called check_workflow without
+    the definition, so the whole pass was dead code with a green suite. A unit
+    test on the function could never have caught that. This one drives scan
+    with the network stubbed and asserts the finding comes out the far end.
+    """
+    broken = {
+        "id": "7", "name": "nightly",
+        "nodes": [{"name": "Parse", "type": "n8n-nodes-base.code",
+                   "typeVersion": 2,
+                   "parameters": {"jsCode": "const o = JSON.parse(x);"}}],
+        "connections": {},
+    }
+    real_active = monitor.active_workflows
+    real_runs = monitor.recent_successful_executions
+    monitor.active_workflows = lambda base, api_key, limit=250: [broken]
+    monitor.recent_successful_executions = \
+        lambda base, api_key, wid, limit=None: [execution(5, items=10)]
+    try:
+        alerts, _ = monitor.scan("https://n8n.example", "k", NOW)
+    finally:
+        monitor.active_workflows = real_active
+        monitor.recent_successful_executions = real_runs
+
+    assert "unguarded_json_parse" in [a["kind"] for a in alerts]
+
+
+def test_scan_still_reports_static_defects_when_history_is_unreachable():
+    """The definition is already in hand when the execution call fails, and the
+    static pass needs nothing else. A half-broken scan should still say what it
+    can read rather than only that it could not read."""
+    broken = {
+        "id": "7", "name": "nightly",
+        "nodes": [{"name": "Parse", "type": "n8n-nodes-base.code",
+                   "typeVersion": 2,
+                   "parameters": {"jsCode": "const o = JSON.parse(x);"}}],
+        "connections": {},
+    }
+
+    def boom(base, api_key, wid, limit=None):
+        raise OSError("connection refused")
+
+    real_active = monitor.active_workflows
+    real_runs = monitor.recent_successful_executions
+    monitor.active_workflows = lambda base, api_key, limit=250: [broken]
+    monitor.recent_successful_executions = boom
+    try:
+        alerts, _ = monitor.scan("https://n8n.example", "k", NOW)
+    finally:
+        monitor.active_workflows = real_active
+        monitor.recent_successful_executions = real_runs
+
+    kinds_seen = [a["kind"] for a in alerts]
+    assert "unreachable" in kinds_seen
+    assert "unguarded_json_parse" in kinds_seen

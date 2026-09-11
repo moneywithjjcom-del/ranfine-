@@ -1329,8 +1329,12 @@ def scan(base, api_key, now, limit=SCAN_LIMIT):
         except (urllib.error.URLError, OSError, ValueError) as exc:
             alerts.append({"workflow": spec["name"], "kind": "unreachable",
                            "detail": "could not query n8n: %s" % exc})
+            # The history call failed, but the definition is already in hand and
+            # the static pass needs nothing else. Report what can still be read.
+            alerts.extend(static_findings(workflow))
             continue
-        alerts.extend(check_workflow(spec, runs, now, declared))
+        alerts.extend(check_workflow(spec, runs, now, declared,
+                                     workflow=workflow))
         proposed = propose_expectation(runs)
         if proposed is not None:
             spec["expected_items"] = proposed
@@ -1494,6 +1498,13 @@ def main(argv):
                 # Unknown is safer than stale: without the declared set the
                 # step check simply has no opinion this run.
                 declared = None
+        # No workflow= here, deliberately. Watch is the recurring mode, and a
+        # static defect does not change between runs: it would fire every few
+        # minutes, for ever, saying the same thing, until somebody muted the
+        # channel and stopped reading the alerts that do change. The same data
+        # is a finding in `scan` -- asked for once, by a person, read once --
+        # and a flood here. Whether it is noise depends on whether somebody
+        # asked, which is the whole difference between an audit and a monitor.
         alerts.extend(check_workflow(spec, runs, now, declared))
 
     report = format_report(alerts)
