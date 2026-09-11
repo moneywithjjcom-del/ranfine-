@@ -9,7 +9,34 @@ Three questions n8n won't answer:
 2. **Has it checked in recently enough?**
 3. **Did the last run produce roughly what it usually produces?**
 
+And one it can't answer by looking at runs at all:
+
+4. **Is this workflow built in a way that has been wrong all along?**
+
 Read-only. It never writes to your n8n.
+
+## The blind spot the first three share
+
+All three compare a run against that workflow's own past, which makes them
+*change* detectors. A workflow that has been wrong since its first execution has
+no healthy baseline to differ from, so it is invisible to them by construction —
+and that is the case a client most fears, because it is the one they inherited
+and never saw.
+
+`static_findings()` reads the workflow definition instead of its history. Three
+classes today, each a failure mode an operator measured as their own miss:
+
+| finding | what it catches |
+| --- | --- |
+| `input_item_after_http` | `$input.item` read downstream of an HTTP call, where the item is the API response rather than the original record. The row is still written and the count is still right. |
+| `unguarded_json_parse` | `JSON.parse` with no `try`, so a reply that isn't JSON becomes either a failed run or a silently malformed row. |
+| `body_in_wrong_field` | Set to send raw JSON with `jsonBody` empty. The call succeeds, the remote ignores it, the run is green, and nothing was sent. |
+
+This runs in `--scan` and deliberately **not** in `--watch`. A static defect
+doesn't change between runs, so in the recurring mode it would fire every few
+minutes for ever until somebody muted the channel and stopped reading the alerts
+that *do* change. Whether a finding is noise depends on whether somebody asked
+for it, which is the whole difference between an audit and a monitor.
 
 ## What this is, and what it isn't
 
