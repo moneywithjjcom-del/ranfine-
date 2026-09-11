@@ -61,6 +61,28 @@ def statement(minutes_ago, *descriptions):
                fields=[{"description": d} for d in descriptions])
 
 
+def http_node(name, **params):
+    return {"name": name, "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2, "parameters": params}
+
+
+def code_node(name, source):
+    return {"name": name, "type": "n8n-nodes-base.code",
+            "typeVersion": 2, "parameters": {"jsCode": source}}
+
+
+def graph(*nodes):
+    """A workflow definition as GET /api/v1/workflows returns it.
+
+    Wired as a straight line, which is all the static checks need: they ask
+    what runs after what, not how many branches there are.
+    """
+    names = [n["name"] for n in nodes]
+    connections = {a: {"main": [[{"node": b, "type": "main", "index": 0}]]}
+                   for a, b in zip(names, names[1:])}
+    return {"name": "wf", "nodes": list(nodes), "connections": connections}
+
+
 HOURLY = {"name": "pull", "every_minutes": 60, "watch_output": True}
 
 CASES = [
@@ -146,7 +168,10 @@ CASES = [
          source="enzosoftware (308708): six of his eleven misses, one class",
          # Broken since the first run: there is no healthy baseline to deviate
          # from, which is the shape a static defect always takes in production.
-         spec=HOURLY, runs=hourly([0] * 9)),
+         spec=HOURLY, runs=hourly([0] * 9),
+         workflow=graph(http_node("Post to API", sendBody=True,
+                                  specifyBody="json",
+                                  body='{"id": "{{ $json.id }}"}'))),
 
     dict(label="broken", name="$input.item.json read after an HTTP call",
          source="enzosoftware (308708): four misses; the row written holds the "
@@ -155,12 +180,18 @@ CASES = [
          # they have been wrong since day one.
          spec=HOURLY,
          runs=[run(30 + i * 60, fields=[{"status": "ok"}] * 12)
-               for i in range(0, 9)]),
+               for i in range(0, 9)],
+         workflow=graph(http_node("Enrich", sendBody=False),
+                        code_node("Build row",
+                                  "return [{json: {id: $input.item.json.id}}];"))),
 
     dict(label="broken", name="fragile JSON parse of a model reply",
          source="enzosoftware (308708): his one miss he believes undetectable",
          # Intermittent: most runs fine, this one wrote a short batch.
-         spec=HOURLY, runs=hourly([11, 12, 12, 11, 12, 12, 13, 12])),
+         spec=HOURLY, runs=hourly([11, 12, 12, 11, 12, 12, 13, 12]),
+         workflow=graph(code_node("Parse reply",
+                                  "const out = JSON.parse($json.text);\n"
+                                  "return [{json: out}];"))),
 
     # ---- healthy: these must stay silent ----------------------------------
     dict(label="healthy", name="ordinary run, stable volume",
@@ -190,6 +221,32 @@ CASES = [
          runs=[statement(60 + i * 1440, "AWS") for i in range(0, 12)]
               + [statement(60 + 12 * 1440, "AWS", "Rent")]
               + [statement(60 + i * 1440, "AWS") for i in range(13, 40)]),
+
+    # The static pass has to earn its recall. These three are the same shapes
+    # it fires on, arranged the way a competent builder would write them: if
+    # any of them trips, the pass is matching on text rather than on meaning.
+    dict(label="healthy", name="$input.item read with no HTTP call upstream",
+         source="the same expression is correct when the item is still the item",
+         spec=HOURLY, runs=hourly([12, 11, 12, 13, 12, 12, 11, 12]),
+         workflow=graph(code_node("Build row",
+                                  "return [{json: {id: $input.item.json.id}}];"))),
+
+    dict(label="healthy", name="JSON.parse inside a try/catch",
+         source="the guarded version of enzosoftware's undetectable miss",
+         spec=HOURLY, runs=hourly([12, 11, 12, 13, 12, 12, 11, 12]),
+         workflow=graph(code_node("Parse reply",
+                                  "let out;\n"
+                                  "try { out = JSON.parse($json.text); }\n"
+                                  "catch (e) { throw new Error('model reply was "
+                                  "not JSON'); }\n"
+                                  "return [{json: out}];"))),
+
+    dict(label="healthy", name="raw JSON body put in the field that is sent",
+         source="the correct version of the bodyParameters class",
+         spec=HOURLY, runs=hourly([12, 11, 12, 13, 12, 12, 11, 12]),
+         workflow=graph(http_node("Post to API", sendBody=True,
+                                  specifyBody="json",
+                                  jsonBody='{"id": "{{ $json.id }}"}'))),
 ]
 
 
@@ -197,7 +254,8 @@ def main():
     tp = fp = fn = tn = 0
     misses, false_alarms = [], []
     for case in CASES:
-        alerts = monitor.check_workflow(case["spec"], case["runs"], NOW)
+        alerts = monitor.check_workflow(case["spec"], case["runs"], NOW,
+                                        workflow=case.get("workflow"))
         fired = bool(alerts)
         broken = case["label"] == "broken"
         if broken and fired:

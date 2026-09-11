@@ -116,6 +116,12 @@ SCHEDULE_TRIGGERS = ("n8n-nodes-base.scheduleTrigger",
                      "n8n-nodes-base.cron",
                      "n8n-nodes-base.interval")
 
+# Node types the static pass needs to recognise. Kept narrow on purpose: a
+# guess here becomes a false finding in a report a stranger is reading.
+HTTP_TYPES = ("n8n-nodes-base.httpRequest",)
+CODE_TYPES = ("n8n-nodes-base.code", "n8n-nodes-base.function",
+              "n8n-nodes-base.functionItem")
+
 # Enough to turn a trigger rule into "how often should this have checked in".
 MINUTES_PER = {"minutes": 1.0, "hours": 60.0, "days": 1440.0, "weeks": 10080.0}
 
@@ -698,6 +704,100 @@ def schedule_minutes(workflow):
     return best
 
 
+def _downstream_of(workflow, types):
+    """Names of every node reachable from any node of the given types.
+
+    Follows main connections forward. Used to answer "is this Code node
+    reading an item that an HTTP call has already replaced", which is only a
+    defect when the HTTP node is upstream.
+    """
+    nodes = (workflow or {}).get("nodes") or []
+    edges = {}
+    for source, outputs in ((workflow or {}).get("connections") or {}).items():
+        targets = edges.setdefault(source, set())
+        for branch in (outputs or {}).get("main") or []:
+            for link in branch or []:
+                if isinstance(link, dict) and link.get("node"):
+                    targets.add(link["node"])
+
+    frontier = [n.get("name") for n in nodes if n.get("type") in types]
+    seen = set()
+    while frontier:
+        current = frontier.pop()
+        for target in edges.get(current, ()):
+            if target not in seen:
+                seen.add(target)
+                frontier.append(target)
+    return seen
+
+
+def _code_of(node):
+    params = node.get("parameters") or {}
+    parts = [params.get(key) for key in ("jsCode", "pythonCode", "code")]
+    return "\n".join(p for p in parts if isinstance(p, str))
+
+
+def static_findings(workflow):
+    """Defects readable in the workflow itself, with no execution history.
+
+    Every other check here compares a run against that workflow's own past,
+    which makes them change detectors: a workflow that has been wrong since its
+    first execution has no healthy baseline to differ from and is invisible to
+    them by construction. These three read the node graph instead, so they see
+    a defect that has never once produced a bad-looking run.
+
+    All three are failure modes enzosoftware measured as his own misses on
+    community.n8n.io/t/308708, handed over with an invitation to test them.
+    """
+    findings = []
+    name = (workflow or {}).get("name") or str((workflow or {}).get("id") or "")
+    after_http = _downstream_of(workflow, HTTP_TYPES)
+
+    for node in (workflow or {}).get("nodes") or []:
+        node_name = node.get("name") or "?"
+        params = node.get("parameters") or {}
+
+        if node.get("type") in CODE_TYPES:
+            code = _code_of(node)
+
+            # After an HTTP node the item IS the API response, so anything
+            # reaching back for the original record gets fields that are not
+            # there. The row still gets written and the count is still right.
+            if node_name in after_http and "$input.item" in code:
+                findings.append({
+                    "workflow": name,
+                    "kind": "input_item_after_http",
+                    "detail": "%s reads $input.item downstream of an HTTP call, "
+                              "where the item is the API response rather than "
+                              "the original record" % node_name,
+                })
+
+            # One try/catch decides whether a bad model reply is an error or a
+            # silently malformed row.
+            if "JSON.parse(" in code and "try" not in code:
+                findings.append({
+                    "workflow": name,
+                    "kind": "unguarded_json_parse",
+                    "detail": "%s calls JSON.parse with no try/catch, so a reply "
+                              "that is not JSON becomes a failed run or a bad row"
+                              % node_name,
+                })
+
+        # Raw JSON put in the wrong field is sent as nothing at all: the call
+        # succeeds, the remote ignores it, and the run is green.
+        if node.get("type") in HTTP_TYPES and params.get("sendBody"):
+            if params.get("specifyBody") == "json" and not params.get("jsonBody"):
+                findings.append({
+                    "workflow": name,
+                    "kind": "body_in_wrong_field",
+                    "detail": "%s is set to send raw JSON but jsonBody is empty; "
+                              "a payload in any other field is not sent"
+                              % node_name,
+                })
+
+    return findings
+
+
 def spec_for(workflow):
     """A watch spec for a workflow nobody has configured by hand.
 
@@ -842,19 +942,31 @@ def human(delta):
     return "%dd %dh" % (total // 86400, (total % 86400) // 3600)
 
 
-def check_workflow(spec, executions, now, declared=None):
+def check_workflow(spec, executions, now, declared=None, workflow=None):
     """Alerts for one workflow. `executions` is newest-first, successful only.
 
     Empty list means it has never succeeded -- which is its own alarm, not a
     staleness one. Staleness needs a baseline to compare against, and "never
     ran" has no baseline: a schedule trigger that was never going to fire looks
     identical to a healthy workflow that simply has not been due yet.
+
+    `workflow` is the definition as the API returns it. Pass it and the static
+    pass runs too, which is the only way to see a defect that has been there
+    since the first execution: every other check here needs a healthy past to
+    compare against, and that kind of fault never had one.
     """
     name = spec.get("name") or spec.get("id")
     alerts = []
 
+    # Runs first and unconditionally. A workflow that has never executed can
+    # still be visibly broken, and that is precisely the case history cannot
+    # reach.
+    for finding in (static_findings(workflow) if workflow else []):
+        finding["workflow"] = name  # the spec's name is what every alert uses
+        alerts.append(finding)
+
     if not executions:
-        return [{
+        return alerts + [{
             "workflow": name,
             "kind": "never_ran",
             "detail": "no successful execution on record -- if this was just "

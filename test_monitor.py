@@ -1247,3 +1247,100 @@ def test_a_failed_ping_never_raises():
     def boom(url, timeout=None):
         raise OSError("connection refused")
     assert monitor.report_own_liveness("https://hc.example/abc", boom) is False
+
+
+# --- the static pass: defects visible without any execution history ---------
+#
+# Every other check here is a change detector, so a workflow that has been
+# wrong since its first run has no healthy baseline to differ from. These read
+# the node graph instead. The healthy cases matter more than the broken ones:
+# they are the same shapes written correctly, and a check that matches on text
+# rather than meaning trips on them.
+
+def wf(*nodes):
+    names = [n["name"] for n in nodes]
+    return {"name": "wf", "nodes": list(nodes),
+            "connections": {a: {"main": [[{"node": b, "type": "main",
+                                           "index": 0}]]}
+                            for a, b in zip(names, names[1:])}}
+
+
+def http_node(name, **params):
+    return {"name": name, "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2, "parameters": params}
+
+
+def code_node(name, source):
+    return {"name": name, "type": "n8n-nodes-base.code",
+            "typeVersion": 2, "parameters": {"jsCode": source}}
+
+
+def kinds(workflow):
+    return sorted(f["kind"] for f in monitor.static_findings(workflow))
+
+
+def test_input_item_after_an_http_call_is_a_finding():
+    """After the HTTP node the item IS the response, so reaching back for the
+    original record silently reads fields that are not there."""
+    assert kinds(wf(http_node("Enrich"),
+                    code_node("Row", "$input.item.json.id"))) == \
+        ["input_item_after_http"]
+
+
+def test_input_item_with_no_http_upstream_is_silent():
+    """The same expression is correct when the item is still the item."""
+    assert kinds(wf(code_node("Row", "$input.item.json.id"))) == []
+
+
+def test_input_item_upstream_of_the_http_call_is_silent():
+    """Order matters: before the call, the original record is still there."""
+    assert kinds(wf(code_node("Row", "$input.item.json.id"),
+                    http_node("Enrich"))) == []
+
+
+def test_unguarded_json_parse_is_a_finding():
+    assert kinds(wf(code_node("Parse", "const o = JSON.parse(x);"))) == \
+        ["unguarded_json_parse"]
+
+
+def test_json_parse_inside_a_try_is_silent():
+    assert kinds(wf(code_node("Parse",
+                              "try { JSON.parse(x); } catch (e) { fail(e); }"))) == []
+
+
+def test_raw_json_selected_but_left_empty_is_a_finding():
+    """A payload in any other field is simply not sent, and the call is green."""
+    assert kinds(wf(http_node("Post", sendBody=True, specifyBody="json",
+                              body='{"id": 1}'))) == ["body_in_wrong_field"]
+
+
+def test_raw_json_in_the_field_that_is_sent_is_silent():
+    assert kinds(wf(http_node("Post", sendBody=True, specifyBody="json",
+                              jsonBody='{"id": 1}'))) == []
+
+
+def test_a_node_sending_no_body_is_silent():
+    assert kinds(wf(http_node("Get", sendBody=False))) == []
+
+
+def test_static_findings_survive_a_workflow_with_nothing_in_it():
+    assert monitor.static_findings({}) == []
+    assert monitor.static_findings(None) == []
+
+
+def test_check_workflow_reports_static_defects_with_no_history_at_all():
+    """The never-ran path must still carry them: a workflow that has never
+    executed is exactly the case history cannot reach."""
+    alerts = monitor.check_workflow(
+        {"name": "pull"}, [], NOW,
+        workflow=wf(code_node("Parse", "JSON.parse(x)")))
+    assert [a["kind"] for a in alerts] == ["unguarded_json_parse", "never_ran"]
+    assert all(a["workflow"] == "pull" for a in alerts)
+
+
+def test_check_workflow_without_a_definition_is_unchanged():
+    """Callers that pass no workflow get exactly what they got before."""
+    assert monitor.check_workflow({"name": "pull"}, [], NOW) == [
+        {"workflow": "pull", "kind": "never_ran",
+         "detail": "no successful execution on record -- if this was just "
+                   "published, check the trigger actually fires on its own"}]
